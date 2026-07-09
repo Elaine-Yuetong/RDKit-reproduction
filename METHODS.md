@@ -61,6 +61,10 @@ Open-source cheminformatics toolkit. For us it does four jobs:
    fp = gen.GetFingerprintAsNumPy(mol)
    ```
    radius=2, 2048 bits ≈ "ECFP4", the de-facto standard.
+   Sanity band for mean bits set per fingerprint: ~30-60 (band calibrated
+   for drug-like molecules of 20-40 heavy atoms; for QM9's <=9-heavy-atom
+   molecules, ~20 mean bits is the verified-correct value — confirmed
+   against GetNumOnBits and unfolded counts, 2026 run).
 4. **Murcko scaffolds** for the scaffold split
    (`rdkit.Chem.Scaffolds.MurckoScaffold`).
 
