@@ -99,7 +99,12 @@ def train_rf(Xtr, ytr):
     model = RandomForestRegressor(
         n_estimators=300, n_jobs=-1, random_state=SEED)
     model.fit(Xtr, ytr)
-    return model, {"best_params": None, "n_estimators": 300}
+    fixed_params = {
+        "n_estimators": 300,
+        "max_depth": None,
+        "note": "fixed by spec, no tuning",
+    }
+    return model, {"best_params": fixed_params, "n_estimators": 300}
 
 
 def fit_config(df, X, target, features, split, model, verbose=True):
