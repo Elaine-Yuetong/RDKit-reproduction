@@ -41,3 +41,30 @@ for our in-house DFT data (ESP, ion binding energy) with a one-line change.
 ## Definition of done for Phase 1
 - One command reproduces the full table: 5 targets x 3 feature sets x 2 splits.
 - A short RESULTS.md comparing our MAE vs published values.
+
+## Phase 2
+
+### Goal
+Reproduce the learned-representation era on QM9 with SchNet in Colab, using
+3D coordinates from `torch_geometric.datasets.QM9`, and compare gap MAE against
+the audited Phase 1 baseline.
+
+### Protocol
+- Run Phase 2 on Colab GPU only; do not install torch/PyG into the local venv.
+- Use `phase2/train_schnet.py` with PyTorch Geometric QM9 and target `gap`
+  (PyG target index 4, already in eV).
+- Standard-normalize the target on the training subset, early-stop on the
+  frozen validation intersection, and report test MAE/R2 in eV.
+- Start with `--train_subset 50000`; the exact full-paper number is not the
+  goal for this first run.
+
+### Success band
+With 50k training molecules, expect gap MAE roughly 0.08-0.12 eV. The Phase 1
+numbers to beat are 0.1364 eV on the random split and 0.2904 eV on the scaffold
+split.
+
+### Frozen-exam rule
+The files in `data/splits/` are the portable exam definition. Phase 2 must
+validate `data/splits/manifest.json`, match PyG QM9 molecules to those split
+CSVs by canonical SMILES, and train/evaluate only on the matching intersections.
+Never train on molecules matching the frozen validation or test SMILES.

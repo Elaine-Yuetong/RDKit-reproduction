@@ -1,0 +1,51 @@
+{
+  "columns": [
+    "row_index",
+    "canonical_smiles",
+    "homo",
+    "lumo",
+    "gap",
+    "mu",
+    "alpha"
+  ],
+  "dedup_row_total": 133798,
+  "files": {
+    "random_test.csv": {
+      "canonical_smiles_sha256": "a2c2dae4524b83de8a9a485dea0266cc0fcb92e9ab0403d497d3f20d799c107a",
+      "part": "test",
+      "row_count": 13381,
+      "split": "random"
+    },
+    "random_train.csv": {
+      "canonical_smiles_sha256": "655c68a6425cdd158de66fe6995363db1fb2095bbdd580e40f0b94633ea2f454",
+      "part": "train",
+      "row_count": 107038,
+      "split": "random"
+    },
+    "random_val.csv": {
+      "canonical_smiles_sha256": "86206324a6aaaa3cbd50a071d548614e84cb84e0a1e5e4f52534dfea982c3ba7",
+      "part": "val",
+      "row_count": 13379,
+      "split": "random"
+    },
+    "scaffold_test.csv": {
+      "canonical_smiles_sha256": "1fc1bbc79d329611dbcc98f1f3bbc4747ce86dd7fd7aa3341b3dc30d08f2ec6a",
+      "part": "test",
+      "row_count": 13380,
+      "split": "scaffold"
+    },
+    "scaffold_train.csv": {
+      "canonical_smiles_sha256": "38aef49b364f86faf9c93df0edd39a808de781b4ecf291885cea92704218eedc",
+      "part": "train",
+      "row_count": 107038,
+      "split": "scaffold"
+    },
+    "scaffold_val.csv": {
+      "canonical_smiles_sha256": "0b24c40af4f3c1c21b26acbc839e71e562c2f72fe227ad0c4587f52fc414c5c8",
+      "part": "val",
+      "row_count": 13380,
+      "split": "scaffold"
+    }
+  },
+  "seed": 42
+}

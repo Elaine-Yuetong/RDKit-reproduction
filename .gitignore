@@ -1,4 +1,7 @@
-data/
+data/*
+!data/splits/
+!data/splits/*.csv
+!data/splits/manifest.json
 results/
 venv/
 __pycache__/
