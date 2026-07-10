@@ -1,0 +1,1 @@
+Read CLAUDE.md, METHODS.md, and HISTORY.md before any work. METHODS.md is the scientific source of truth. Use ./venv/bin/python for ALL commands — never system python or conda. Never re-split data; splits come frozen (seed=42) from src.data. Stop at declared checkpoints and show outputs before proceeding.

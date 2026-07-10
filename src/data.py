@@ -117,6 +117,14 @@ def load_qm9(csv_path: str = CSV_PATH, verbose: bool = True) -> pd.DataFrame:
 
     n_before = len(df)
     df = df[df["canonical_smiles"].notna()].reset_index(drop=True)
+    n_parsed = len(df)
+
+    # Drop duplicate canonical SMILES (keep first): the same molecule must not
+    # straddle train/test, which would leak. QM9 has a handful (~87) of raw
+    # SMILES that canonicalize to an already-seen structure.
+    dup_mask = df["canonical_smiles"].duplicated(keep="first")
+    n_dup = int(dup_mask.sum())
+    df = df[~dup_mask].reset_index(drop=True)
     n_after = len(df)
 
     # Hartree -> eV, once.
@@ -125,7 +133,9 @@ def load_qm9(csv_path: str = CSV_PATH, verbose: bool = True) -> pd.DataFrame:
 
     if verbose:
         print(f"Dropped {bad} unparseable SMILES "
-              f"({n_before} -> {n_after} rows)")
+              f"({n_before} -> {n_parsed} rows)")
+        print(f"Dropped {n_dup} duplicate canonical SMILES "
+              f"({n_parsed} -> {n_after} rows)")
 
     return df
 
