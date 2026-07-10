@@ -151,7 +151,13 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--data_root", default="phase2/pyg_qm9")
     ap.add_argument("--out_dir", default="phase2/runs")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--smoke", action="store_true",
+                    help="fast end-to-end test: train_subset=2000, epochs=3")
     args = ap.parse_args()
+    if args.smoke:
+        args.train_subset = 2000
+        args.epochs = 3
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -212,13 +218,32 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_name = f"schnet_{args.target}_{args.split}_{len(train_idx)}"
     ckpt_path = out_dir / f"{run_name}.pt"
+    state_path = out_dir / f"{run_name}_state.json"
     metrics_path = out_dir / f"{run_name}.json"
 
     best_val = float("inf")
     best_epoch = -1
+    start_epoch = 1
     patience = 15
     stale = 0
-    for epoch in range(1, args.epochs + 1):
+    if args.resume and ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        mean = torch.tensor(float(ckpt["mean"]), device=device)
+        std = torch.tensor(float(ckpt["std"]), device=device)
+        start_epoch = int(ckpt.get("last_epoch", 0)) + 1
+        best_val = float(ckpt.get("best_val", best_val))
+        best_epoch = int(ckpt.get("best_epoch", best_epoch))
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            start_epoch = int(state.get("last_epoch", 0)) + 1
+            best_val = float(state.get("best_val", best_val))
+            best_epoch = int(state.get("best_epoch", best_epoch))
+            stale = max(0, start_epoch - best_epoch - 1)
+        print(f"resuming from {ckpt_path}: start_epoch={start_epoch} "
+              f"best_val={best_val:.4f} best_epoch={best_epoch}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         total_loss = 0.0
         n_seen = 0
@@ -244,8 +269,16 @@ def main() -> None:
             stale = 0
             torch.save({"model_state_dict": model.state_dict(),
                         "mean": float(mean.item()),
+                        "last_epoch": int(epoch),
+                        "best_val": float(best_val),
+                        "best_epoch": int(best_epoch),
                         "std": float(std.item()),
                         "args": vars(args)}, ckpt_path)
+            state_path.write_text(json.dumps({
+                "last_epoch": int(epoch),
+                "best_val": float(best_val),
+                "best_epoch": int(best_epoch),
+            }, indent=2, sort_keys=True) + "\n")
         else:
             stale += 1
             if stale >= patience:
