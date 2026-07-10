@@ -6,8 +6,8 @@ local Phase-1 venv.
 ## Colab Cells
 
 ```bash
-!git clone <REPO_URL>
-%cd RDKit
+!git clone https://github.com/Elaine-Yuetong/RDKit-reproduction.git
+%cd RDKit-reproduction
 ```
 
 ```python
