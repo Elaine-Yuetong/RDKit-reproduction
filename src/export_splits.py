@@ -21,7 +21,7 @@ RDLogger.DisableLog("rdApp.*")
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 SPLITS_DIR = ROOT / "data" / "splits"
-EXPORT_COLUMNS = ["row_index", "canonical_smiles", *TARGETS]
+EXPORT_COLUMNS = ["row_index", "mol_id", "canonical_smiles", *TARGETS]
 EXPECTED_DEDUP_ROWS = 133798
 
 
@@ -60,7 +60,7 @@ def export_splits(out_dir: Path = SPLITS_DIR) -> dict:
         for part in ("train", "val", "test"):
             key = f"{split_name}_{part}"
             idx = splits[key]
-            export = df.loc[idx, ["canonical_smiles", *TARGETS]].copy()
+            export = df.loc[idx, ["mol_id", "canonical_smiles", *TARGETS]].copy()
             export.insert(0, "row_index", idx)
             export = export[EXPORT_COLUMNS]
 
@@ -72,6 +72,7 @@ def export_splits(out_dir: Path = SPLITS_DIR) -> dict:
                 "row_count": int(len(export)),
                 "canonical_smiles_sha256": smiles_sha256(
                     export["canonical_smiles"]),
+                "mol_id_sha256": smiles_sha256(export["mol_id"]),
             }
 
     manifest_path = out_dir / "manifest.json"
@@ -86,7 +87,8 @@ def main() -> None:
     print("\nCounts:")
     for name, meta in manifest["files"].items():
         print(f"  {name:24s} {meta['row_count']:7d}  "
-              f"sha256={meta['canonical_smiles_sha256']}")
+              f"smiles_sha256={meta['canonical_smiles_sha256']}  "
+              f"mol_id_sha256={meta['mol_id_sha256']}")
     print("\nManifest:")
     print(json.dumps(manifest, indent=2, sort_keys=True))
 
