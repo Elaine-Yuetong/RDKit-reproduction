@@ -2,6 +2,9 @@ data/*
 !data/splits/
 !data/splits/*.csv
 !data/splits/manifest.json
+data/dft_real/
+ml_dft_labeled_20260711.tar.gz
+*.tar.gz
 results/
 venv/
 __pycache__/
