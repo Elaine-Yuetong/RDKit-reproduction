@@ -53,6 +53,38 @@ def canonicalize(smiles: str) -> str:
     return Chem.MolToSmiles(mol)
 
 
+def canonicalize_pyg_smiles(smiles: str) -> tuple[str | None, bool]:
+    """Canonicalize PyG QM9 SMILES for matching.
+
+    PyG's QM9 `smiles` field can contain explicit-H strained structures that
+    fail RDKit's default sanitization. Those are a PyG-side matching concern,
+    not a frozen-split concern, so unrecoverable molecules are skipped instead
+    of aborting the whole run. Returns (canonical_smiles, used_fallback).
+    """
+    if not isinstance(smiles, str):
+        return None, False
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is not None:
+        return Chem.MolToSmiles(mol), False
+
+    mol = Chem.MolFromSmiles(smiles, sanitize=False)
+    if mol is None:
+        return None, False
+    try:
+        Chem.SanitizeMol(mol)
+        return Chem.MolToSmiles(Chem.RemoveHs(mol)), True
+    except Exception:
+        pass
+
+    try:
+        mol_no_h = Chem.RemoveHs(mol, sanitize=False)
+        Chem.SanitizeMol(mol_no_h)
+        return Chem.MolToSmiles(mol_no_h), True
+    except Exception:
+        return None, True
+
+
 def read_split_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as f:
         return list(csv.DictReader(f))
@@ -90,12 +122,34 @@ def pyg_smiles(data) -> str:
     return str(data.smiles)
 
 
-def build_pyg_index(dataset: QM9) -> dict[str, int]:
+def build_pyg_index(dataset: QM9) -> tuple[dict[str, int], dict[int, str], dict]:
     mapping = {}
+    idx_to_smiles = {}
+    skipped = 0
+    fallback_recovered = 0
+    skipped_examples = []
     for i, data in enumerate(dataset):
-        smi = canonicalize(pyg_smiles(data))
+        raw = pyg_smiles(data)
+        try:
+            smi, used_fallback = canonicalize_pyg_smiles(raw)
+        except Exception:
+            smi, used_fallback = None, False
+        if smi is None:
+            skipped += 1
+            if len(skipped_examples) < 5:
+                skipped_examples.append(raw)
+            continue
+        if used_fallback:
+            fallback_recovered += 1
         mapping.setdefault(smi, i)
-    return mapping
+        idx_to_smiles[i] = smi
+    stats = {
+        "pyg_unparseable_skipped": int(skipped),
+        "pyg_fallback_recovered": int(fallback_recovered),
+        "pyg_skipped_examples": skipped_examples,
+    }
+    print(json.dumps({"pyg_smiles_indexing": stats}, indent=2, sort_keys=True))
+    return mapping, idx_to_smiles, stats
 
 
 def matched_indices(split_rows, pyg_by_smiles):
@@ -169,7 +223,7 @@ def main() -> None:
         Path(args.splits_dir), args.split)
 
     dataset = QM9(root=args.data_root)
-    pyg_by_smiles = build_pyg_index(dataset)
+    pyg_by_smiles, pyg_idx_to_smiles, pyg_index_stats = build_pyg_index(dataset)
 
     train_idx, train_smiles = matched_indices(split_rows["train"], pyg_by_smiles)
     val_idx, val_smiles = matched_indices(split_rows["val"], pyg_by_smiles)
@@ -178,7 +232,7 @@ def main() -> None:
     val_test_smiles = set(val_smiles) | set(test_smiles)
     train_idx = [
         i for i in train_idx
-        if canonicalize(pyg_smiles(dataset[i])) not in val_test_smiles
+        if pyg_idx_to_smiles[i] not in val_test_smiles
     ]
     train_idx = subset_indices(train_idx, args.train_subset, args.seed)
     if not train_idx or not val_idx or not test_idx:
@@ -196,8 +250,14 @@ def main() -> None:
         "matched_val_count": int(len(val_idx)),
         "matched_test_count": int(len(test_idx)),
         "test_coverage_fraction": float(len(test_idx) / len(test_smiles)),
+        **pyg_index_stats,
     }
     print(json.dumps({"coverage": coverage}, indent=2, sort_keys=True))
+    if coverage["test_coverage_fraction"] < 0.95:
+        raise SystemExit(
+            "test coverage below 0.95 after PyG SMILES matching; this looks "
+            "like a systematic canonicalization mismatch, not a few "
+            "unparseable PyG molecules")
 
     train_loader = DataLoader(dataset[train_idx], batch_size=args.batch_size,
                               shuffle=True)
