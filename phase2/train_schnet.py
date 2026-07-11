@@ -53,36 +53,57 @@ def canonicalize(smiles: str) -> str:
     return Chem.MolToSmiles(mol)
 
 
-def canonicalize_pyg_smiles(smiles: str) -> tuple[str | None, bool]:
-    """Canonicalize PyG QM9 SMILES for matching.
+def mol_for_match(smiles: str) -> tuple[Chem.Mol | None, bool]:
+    """Parse a SMILES into an RDKit Mol for split matching.
 
     PyG's QM9 `smiles` field can contain explicit-H strained structures that
-    fail RDKit's default sanitization. Those are a PyG-side matching concern,
-    not a frozen-split concern, so unrecoverable molecules are skipped instead
-    of aborting the whole run. Returns (canonical_smiles, used_fallback).
+    fail RDKit's default sanitization. The fallback removes explicit hydrogens
+    before sanitization, which recovers many of those cases. Returns
+    (mol_or_none, used_fallback).
     """
     if not isinstance(smiles, str):
         return None, False
 
     mol = Chem.MolFromSmiles(smiles)
     if mol is not None:
-        return Chem.MolToSmiles(mol), False
+        return mol, False
 
     mol = Chem.MolFromSmiles(smiles, sanitize=False)
     if mol is None:
         return None, False
     try:
         Chem.SanitizeMol(mol)
-        return Chem.MolToSmiles(Chem.RemoveHs(mol)), True
+        return Chem.RemoveHs(mol), True
     except Exception:
         pass
 
     try:
         mol_no_h = Chem.RemoveHs(mol, sanitize=False)
         Chem.SanitizeMol(mol_no_h)
-        return Chem.MolToSmiles(mol_no_h), True
+        return mol_no_h, True
     except Exception:
         return None, True
+
+
+def mol_key(smiles: str) -> str | None:
+    """Representation-invariant match key for PyG QM9 vs frozen split rows."""
+    mol, _ = mol_for_match(smiles)
+    if mol is None:
+        return None
+    try:
+        return Chem.MolToInchiKey(mol) or None
+    except Exception:
+        return None
+
+
+def mol_key_with_status(smiles: str) -> tuple[str | None, bool]:
+    mol, used_fallback = mol_for_match(smiles)
+    if mol is None:
+        return None, used_fallback
+    try:
+        return Chem.MolToInchiKey(mol) or None, used_fallback
+    except Exception:
+        return None, used_fallback
 
 
 def read_split_csv(path: Path) -> list[dict[str, str]]:
@@ -124,38 +145,46 @@ def pyg_smiles(data) -> str:
 
 def build_pyg_index(dataset: QM9) -> tuple[dict[str, int], dict[int, str], dict]:
     mapping = {}
-    idx_to_smiles = {}
+    idx_to_key = {}
     skipped = 0
     fallback_recovered = 0
     skipped_examples = []
     for i, data in enumerate(dataset):
         raw = pyg_smiles(data)
         try:
-            smi, used_fallback = canonicalize_pyg_smiles(raw)
+            key, used_fallback = mol_key_with_status(raw)
         except Exception:
-            smi, used_fallback = None, False
-        if smi is None:
+            key, used_fallback = None, False
+        if key is None:
             skipped += 1
             if len(skipped_examples) < 5:
                 skipped_examples.append(raw)
             continue
         if used_fallback:
             fallback_recovered += 1
-        mapping.setdefault(smi, i)
-        idx_to_smiles[i] = smi
+        mapping.setdefault(key, i)
+        idx_to_key[i] = key
     stats = {
         "pyg_unparseable_skipped": int(skipped),
         "pyg_fallback_recovered": int(fallback_recovered),
         "pyg_skipped_examples": skipped_examples,
     }
-    print(json.dumps({"pyg_smiles_indexing": stats}, indent=2, sort_keys=True))
-    return mapping, idx_to_smiles, stats
+    print(json.dumps({"pyg_mol_key_indexing": stats}, indent=2, sort_keys=True))
+    return mapping, idx_to_key, stats
 
 
-def matched_indices(split_rows, pyg_by_smiles):
+def matched_indices(split_rows, pyg_by_key):
     smiles = [r["canonical_smiles"] for r in split_rows]
-    idx = [pyg_by_smiles[s] for s in smiles if s in pyg_by_smiles]
-    return idx, smiles
+    split_keys = []
+    failed = 0
+    for smi in smiles:
+        key = mol_key(smi)
+        if key is None:
+            failed += 1
+            continue
+        split_keys.append(key)
+    idx = [pyg_by_key[k] for k in split_keys if k in pyg_by_key]
+    return idx, split_keys, failed
 
 
 def subset_indices(indices: list[int], n: int, seed: int) -> list[int]:
@@ -223,17 +252,21 @@ def main() -> None:
         Path(args.splits_dir), args.split)
 
     dataset = QM9(root=args.data_root)
-    pyg_by_smiles, pyg_idx_to_smiles, pyg_index_stats = build_pyg_index(dataset)
+    pyg_by_key, pyg_idx_to_key, pyg_index_stats = build_pyg_index(dataset)
 
-    train_idx, train_smiles = matched_indices(split_rows["train"], pyg_by_smiles)
-    val_idx, val_smiles = matched_indices(split_rows["val"], pyg_by_smiles)
-    test_idx, test_smiles = matched_indices(split_rows["test"], pyg_by_smiles)
+    train_idx, train_keys, train_key_failures = matched_indices(
+        split_rows["train"], pyg_by_key)
+    val_idx, val_keys, val_key_failures = matched_indices(
+        split_rows["val"], pyg_by_key)
+    test_idx, test_keys, test_key_failures = matched_indices(
+        split_rows["test"], pyg_by_key)
 
-    val_test_smiles = set(val_smiles) | set(test_smiles)
+    val_test_keys = set(val_keys) | set(test_keys)
     train_idx = [
         i for i in train_idx
-        if pyg_idx_to_smiles[i] not in val_test_smiles
+        if pyg_idx_to_key[i] not in val_test_keys
     ]
+    matched_train_count_before_subset = len(train_idx)
     train_idx = subset_indices(train_idx, args.train_subset, args.seed)
     if not train_idx or not val_idx or not test_idx:
         raise SystemExit(
@@ -242,14 +275,17 @@ def main() -> None:
 
     coverage = {
         "pyg_qm9_size": int(len(dataset)),
-        "frozen_train_count": int(len(train_smiles)),
-        "frozen_val_count": int(len(val_smiles)),
-        "frozen_test_count": int(len(test_smiles)),
-        "matched_train_count_before_subset": int(len(matched_indices(split_rows["train"], pyg_by_smiles)[0])),
+        "frozen_train_count": int(len(split_rows["train"])),
+        "frozen_val_count": int(len(split_rows["val"])),
+        "frozen_test_count": int(len(split_rows["test"])),
+        "split_train_key_failures": int(train_key_failures),
+        "split_val_key_failures": int(val_key_failures),
+        "split_test_key_failures": int(test_key_failures),
+        "matched_train_count_before_subset": int(matched_train_count_before_subset),
         "matched_train_count_used": int(len(train_idx)),
         "matched_val_count": int(len(val_idx)),
         "matched_test_count": int(len(test_idx)),
-        "test_coverage_fraction": float(len(test_idx) / len(test_smiles)),
+        "test_coverage_fraction": float(len(test_idx) / len(split_rows["test"])),
         **pyg_index_stats,
     }
     print(json.dumps({"coverage": coverage}, indent=2, sort_keys=True))
