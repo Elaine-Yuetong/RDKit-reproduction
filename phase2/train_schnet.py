@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import random
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -106,6 +107,73 @@ def mol_key_with_status(smiles: str) -> tuple[str | None, bool]:
         return None, used_fallback
 
 
+def connectivity_key(inchi_key: str | None) -> str | None:
+    if not inchi_key:
+        return None
+    return inchi_key.split("-", 1)[0]
+
+
+def mol_block_key(smiles: str) -> str | None:
+    return connectivity_key(mol_key(smiles))
+
+
+def mol_key_from_pyg_graph(data) -> str | None:
+    """Best-effort key from PyG atomic graph fields, used only as fallback."""
+    if not hasattr(data, "z") or not hasattr(data, "edge_index"):
+        return None
+    try:
+        atomic_nums = [int(z) for z in data.z.tolist()]
+        edges = data.edge_index.t().tolist()
+    except Exception:
+        return None
+    if not atomic_nums or not edges:
+        return None
+
+    rw = Chem.RWMol()
+    for z in atomic_nums:
+        rw.AddAtom(Chem.Atom(z))
+
+    bond_types = {}
+    if hasattr(data, "edge_attr") and data.edge_attr is not None:
+        try:
+            attrs = data.edge_attr.tolist()
+            for edge, attr in zip(edges, attrs):
+                i, j = int(edge[0]), int(edge[1])
+                if i == j:
+                    continue
+                pair = tuple(sorted((i, j)))
+                if isinstance(attr, list) and attr:
+                    k = max(range(len(attr)), key=lambda n: attr[n])
+                else:
+                    k = int(attr)
+                bond_types[pair] = [
+                    Chem.BondType.SINGLE,
+                    Chem.BondType.DOUBLE,
+                    Chem.BondType.TRIPLE,
+                    Chem.BondType.AROMATIC,
+                ][min(k, 3)]
+        except Exception:
+            bond_types = {}
+
+    seen = set()
+    for edge in edges:
+        i, j = int(edge[0]), int(edge[1])
+        if i == j:
+            continue
+        pair = tuple(sorted((i, j)))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        rw.AddBond(pair[0], pair[1], bond_types.get(pair, Chem.BondType.SINGLE))
+
+    mol = rw.GetMol()
+    try:
+        Chem.SanitizeMol(mol)
+        return Chem.MolToInchiKey(mol) or None
+    except Exception:
+        return None
+
+
 def read_split_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as f:
         return list(csv.DictReader(f))
@@ -143,11 +211,14 @@ def pyg_smiles(data) -> str:
     return str(data.smiles)
 
 
-def build_pyg_index(dataset: QM9) -> tuple[dict[str, int], dict[int, str], dict]:
-    mapping = {}
-    idx_to_key = {}
+def build_pyg_index(dataset: QM9) -> tuple[dict, dict, dict, dict]:
+    block_mapping = {}
+    full_mapping = {}
+    idx_to_block = {}
     skipped = 0
     fallback_recovered = 0
+    graph_recovered = 0
+    collision_count = 0
     skipped_examples = []
     for i, data in enumerate(dataset):
         raw = pyg_smiles(data)
@@ -156,35 +227,63 @@ def build_pyg_index(dataset: QM9) -> tuple[dict[str, int], dict[int, str], dict]
         except Exception:
             key, used_fallback = None, False
         if key is None:
+            key = mol_key_from_pyg_graph(data)
+            if key is None:
+                skipped += 1
+                if len(skipped_examples) < 5:
+                    skipped_examples.append(raw)
+                continue
+            graph_recovered += 1
+        if used_fallback:
+            fallback_recovered += 1
+        block = connectivity_key(key)
+        if block is None:
             skipped += 1
             if len(skipped_examples) < 5:
                 skipped_examples.append(raw)
             continue
-        if used_fallback:
-            fallback_recovered += 1
-        mapping.setdefault(key, i)
-        idx_to_key[i] = key
+        full_mapping.setdefault(key, i)
+        if block in block_mapping:
+            collision_count += 1
+        else:
+            block_mapping[block] = i
+        idx_to_block[i] = block
     stats = {
         "pyg_unparseable_skipped": int(skipped),
         "pyg_fallback_recovered": int(fallback_recovered),
+        "pyg_graph_recovered": int(graph_recovered),
+        "pyg_connectivity_collision_count": int(collision_count),
         "pyg_skipped_examples": skipped_examples,
     }
     print(json.dumps({"pyg_mol_key_indexing": stats}, indent=2, sort_keys=True))
-    return mapping, idx_to_key, stats
+    return block_mapping, full_mapping, idx_to_block, stats
 
 
-def matched_indices(split_rows, pyg_by_key):
+def split_keys(split_rows):
     smiles = [r["canonical_smiles"] for r in split_rows]
-    split_keys = []
+    full_keys = []
+    block_keys = []
     failed = 0
     for smi in smiles:
         key = mol_key(smi)
         if key is None:
             failed += 1
             continue
-        split_keys.append(key)
-    idx = [pyg_by_key[k] for k in split_keys if k in pyg_by_key]
-    return idx, split_keys, failed
+        block = connectivity_key(key)
+        if block is None:
+            failed += 1
+            continue
+        full_keys.append(key)
+        block_keys.append(block)
+    counts = Counter(block_keys)
+    intra_collision_rows = sum(c for c in counts.values() if c > 1)
+    return full_keys, block_keys, failed, intra_collision_rows
+
+
+def matched_indices(split_rows, pyg_by_block):
+    _, blocks, failed, intra_collision_rows = split_keys(split_rows)
+    idx = [pyg_by_block[k] for k in blocks if k in pyg_by_block]
+    return idx, blocks, failed, intra_collision_rows
 
 
 def subset_indices(indices: list[int], n: int, seed: int) -> list[int]:
@@ -252,19 +351,40 @@ def main() -> None:
         Path(args.splits_dir), args.split)
 
     dataset = QM9(root=args.data_root)
-    pyg_by_key, pyg_idx_to_key, pyg_index_stats = build_pyg_index(dataset)
+    pyg_by_block, pyg_by_full, pyg_idx_to_block, pyg_index_stats = build_pyg_index(dataset)
 
-    train_idx, train_keys, train_key_failures = matched_indices(
-        split_rows["train"], pyg_by_key)
-    val_idx, val_keys, val_key_failures = matched_indices(
-        split_rows["val"], pyg_by_key)
-    test_idx, test_keys, test_key_failures = matched_indices(
-        split_rows["test"], pyg_by_key)
+    train_full_keys, train_blocks, train_key_failures, train_collision_rows = (
+        split_keys(split_rows["train"]))
+    val_full_keys, val_blocks, val_key_failures, val_collision_rows = split_keys(
+        split_rows["val"])
+    test_full_keys, test_blocks, test_key_failures, test_collision_rows = split_keys(
+        split_rows["test"])
 
-    val_test_keys = set(val_keys) | set(test_keys)
+    split_collision_rows = {
+        "train": int(train_collision_rows),
+        "val": int(val_collision_rows),
+        "test": int(test_collision_rows),
+    }
+    for part, collision_rows in split_collision_rows.items():
+        n_part = len(split_rows[part])
+        if collision_rows / n_part > 0.01:
+            raise SystemExit(
+                f"{part} split has {collision_rows}/{n_part} "
+                "connectivity-key collision rows (>1%); stopping before "
+                "training because the match key is not safe enough")
+
+    train_idx = [pyg_by_block[k] for k in train_blocks if k in pyg_by_block]
+    val_idx = [pyg_by_block[k] for k in val_blocks if k in pyg_by_block]
+    test_idx = [pyg_by_block[k] for k in test_blocks if k in pyg_by_block]
+
+    train_full_match_count = sum(1 for k in train_full_keys if k in pyg_by_full)
+    val_full_match_count = sum(1 for k in val_full_keys if k in pyg_by_full)
+    test_full_match_count = sum(1 for k in test_full_keys if k in pyg_by_full)
+
+    val_test_blocks = set(val_blocks) | set(test_blocks)
     train_idx = [
         i for i in train_idx
-        if pyg_idx_to_key[i] not in val_test_keys
+        if pyg_idx_to_block[i] not in val_test_blocks
     ]
     matched_train_count_before_subset = len(train_idx)
     train_idx = subset_indices(train_idx, args.train_subset, args.seed)
@@ -281,11 +401,19 @@ def main() -> None:
         "split_train_key_failures": int(train_key_failures),
         "split_val_key_failures": int(val_key_failures),
         "split_test_key_failures": int(test_key_failures),
+        "split_train_connectivity_collision_rows": int(train_collision_rows),
+        "split_val_connectivity_collision_rows": int(val_collision_rows),
+        "split_test_connectivity_collision_rows": int(test_collision_rows),
+        "matched_train_count_full_key": int(train_full_match_count),
+        "matched_val_count_full_key": int(val_full_match_count),
+        "matched_test_count_full_key": int(test_full_match_count),
         "matched_train_count_before_subset": int(matched_train_count_before_subset),
         "matched_train_count_used": int(len(train_idx)),
         "matched_val_count": int(len(val_idx)),
         "matched_test_count": int(len(test_idx)),
         "test_coverage_fraction": float(len(test_idx) / len(split_rows["test"])),
+        "full_key_coverage": float(test_full_match_count / len(split_rows["test"])),
+        "first_block_coverage": float(len(test_idx) / len(split_rows["test"])),
         **pyg_index_stats,
     }
     print(json.dumps({"coverage": coverage}, indent=2, sort_keys=True))
