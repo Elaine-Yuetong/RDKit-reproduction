@@ -1,12 +1,12 @@
-"""Train/evaluate Phase 3 ESP models on the real in-house DFT labels.
+"""Train/evaluate Phase 3 models on the real in-house DFT labels.
 
-This is ESP-only for the current checkpoint. It reuses the cached Phase 3
-descriptor + Morgan features and the Phase 1 XGBoost configuration family.
-No QM9, Colab, or Phase 2 assets are touched.
+It reuses the cached Phase 3 descriptor + Morgan features and the Phase 1
+XGBoost configuration family. No QM9, Colab, or Phase 2 assets are touched.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -19,20 +19,38 @@ from phase3.data import DATA_DIR, load_unique_labels
 from phase3.featurize_real import DESC_NPY, FP_NPY, META_JSON
 from src.data import SEED
 
-TARGET = "esp_vmin_mean_kcal_per_mol"
 UNIT = "kcal/mol"
-RESULTS_PATH = Path(__file__).resolve().parents[1] / "results" / "phase3_esp_metrics.json"
+ROOT = Path(__file__).resolve().parents[1]
+RESULTS_DIR = ROOT / "results"
+
+TARGET_CONFIGS = {
+    "esp_vmin_mean_kcal_per_mol": {
+        "short_name": "ESP",
+        "result_path": RESULTS_DIR / "phase3_esp_metrics.json",
+        "label_noise_floor": {
+            "duplicate_std_median": 0.34,
+            "duplicate_std_mean": 2.26,
+            "unit": UNIT,
+        },
+        "outlier_diagnostic": False,
+    },
+    "zn_e_bind_mean_kcal_per_mol": {
+        "short_name": "Zn binding",
+        "result_path": RESULTS_DIR / "phase3_zn_metrics.json",
+        "label_noise_floor": {
+            "duplicate_std_median": 1.73,
+            "duplicate_std_mean": 6.56,
+            "unit": UNIT,
+        },
+        "outlier_diagnostic": True,
+    },
+}
 
 XGB_MAX_DEPTH = [6, 8]
 XGB_LEARNING_RATE = [0.05, 0.1]
 XGB_N_ESTIMATORS = 4000
 XGB_EARLY_STOPPING = 50
 INNER_VAL_FRAC = 0.2
-LABEL_NOISE_FLOOR = {
-    "duplicate_std_median": 0.34,
-    "duplicate_std_mean": 2.26,
-    "unit": UNIT,
-}
 
 
 def load_concat_features(df) -> np.ndarray:
@@ -66,6 +84,12 @@ def mae_r2(y_true, y_pred) -> dict[str, float]:
         "mae": float(mean_absolute_error(y_true, y_pred)),
         "r2": float(r2_score(y_true, y_pred)),
     }
+
+
+def outlier_indices_for_target(y: np.ndarray) -> np.ndarray:
+    """Global |z| > 4 diagnostic indices. These are never removed from training."""
+    z = (y - y.mean()) / y.std(ddof=1)
+    return np.flatnonzero(np.abs(z) > 4)
 
 
 def train_mean_baseline(y_train, y_test) -> dict[str, float]:
@@ -140,8 +164,15 @@ def train_xgb_tuned(X, y, train_idx: np.ndarray, verbose: bool = True):
     }
 
 
-def eval_one_split(name: str, X, y, train_idx: np.ndarray, test_idx: np.ndarray,
-                   fold: int | str) -> dict:
+def eval_one_split(
+    name: str,
+    X,
+    y,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    fold: int | str,
+    outlier_idx: np.ndarray | None = None,
+) -> dict:
     print(f"\n{name} fold={fold} n_train={len(train_idx)} n_test={len(test_idx)}")
     baseline = train_mean_baseline(y[train_idx], y[test_idx])
     print(
@@ -155,7 +186,7 @@ def eval_one_split(name: str, X, y, train_idx: np.ndarray, test_idx: np.ndarray,
         f"    XGB: MAE={metrics['mae']:.4f} {UNIT} R2={metrics['r2']:.4f} "
         f"params={info['best_params']} n_estimators={info['n_estimators']}"
     )
-    return {
+    record = {
         "fold": fold,
         "n_train": int(len(train_idx)),
         "n_test": int(len(test_idx)),
@@ -166,6 +197,25 @@ def eval_one_split(name: str, X, y, train_idx: np.ndarray, test_idx: np.ndarray,
         "train_mean": baseline["train_mean"],
         **info,
     }
+    if outlier_idx is not None:
+        outlier_set = set(map(int, outlier_idx))
+        keep = np.array([int(idx) not in outlier_set for idx in test_idx], dtype=bool)
+        n_excluded = int((~keep).sum())
+        if keep.any():
+            diag_mae = float(mean_absolute_error(y[test_idx][keep], pred[keep]))
+        else:
+            diag_mae = None
+        record["diagnostic_mae_excluding_global_outliers"] = diag_mae
+        record["diagnostic_n_outliers_excluded"] = n_excluded
+        record["diagnostic_n_eval_no_outliers"] = int(keep.sum())
+        if diag_mae is None:
+            print("    diagnostic no-outlier MAE: NA (all test rows excluded)")
+        else:
+            print(
+                f"    diagnostic no-outlier MAE: {diag_mae:.4f} {UNIT} "
+                f"(excluded {n_excluded} global |z|>4 rows from test metric only)"
+            )
+    return record
 
 
 def summarize(records: list[dict]) -> dict:
@@ -173,7 +223,7 @@ def summarize(records: list[dict]) -> dict:
     r2s = np.array([r["r2"] for r in records], dtype=float)
     bmaes = np.array([r["train_mean_baseline_mae"] for r in records], dtype=float)
     br2s = np.array([r["train_mean_baseline_r2"] for r in records], dtype=float)
-    return {
+    summary = {
         "mean_mae": float(maes.mean()),
         "std_mae": float(maes.std(ddof=1)) if len(maes) > 1 else 0.0,
         "mean_r2": float(r2s.mean()),
@@ -183,6 +233,21 @@ def summarize(records: list[dict]) -> dict:
         "mean_train_mean_baseline_r2": float(br2s.mean()),
         "std_train_mean_baseline_r2": float(br2s.std(ddof=1)) if len(br2s) > 1 else 0.0,
     }
+    diag = [
+        r.get("diagnostic_mae_excluding_global_outliers")
+        for r in records
+        if r.get("diagnostic_mae_excluding_global_outliers") is not None
+    ]
+    if diag:
+        d = np.asarray(diag, dtype=float)
+        summary["diagnostic_mean_mae_excluding_global_outliers"] = float(d.mean())
+        summary["diagnostic_std_mae_excluding_global_outliers"] = (
+            float(d.std(ddof=1)) if len(d) > 1 else 0.0
+        )
+        summary["diagnostic_total_outliers_excluded"] = int(
+            sum(r.get("diagnostic_n_outliers_excluded", 0) for r in records)
+        )
+    return summary
 
 
 def scaffold_groups(scaffolds) -> np.ndarray:
@@ -195,15 +260,17 @@ def scaffold_groups(scaffolds) -> np.ndarray:
     return np.asarray(groups, dtype=object)
 
 
-def run_random_cv(X, y) -> dict:
+def run_random_cv(X, y, outlier_idx: np.ndarray | None = None) -> dict:
     records = []
     splitter = KFold(n_splits=5, shuffle=True, random_state=SEED)
     for fold, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
-        records.append(eval_one_split("random_cv", X, y, train_idx, test_idx, fold))
+        records.append(
+            eval_one_split("random_cv", X, y, train_idx, test_idx, fold, outlier_idx)
+        )
     return {"folds": records, "summary": summarize(records)}
 
 
-def run_scaffold_cv(X, y, df) -> dict:
+def run_scaffold_cv(X, y, df, outlier_idx: np.ndarray | None = None) -> dict:
     groups = scaffold_groups(df["murcko_scaffold"].fillna("").astype(str))
     empty_count = int((df["murcko_scaffold"].fillna("") == "").sum())
     records = []
@@ -214,7 +281,9 @@ def run_scaffold_cv(X, y, df) -> dict:
         overlap = train_groups.intersection(test_groups)
         if overlap:
             raise AssertionError(f"scaffold group leakage in fold {fold}: {list(overlap)[:5]}")
-        records.append(eval_one_split("scaffold_cv", X, y, train_idx, test_idx, fold))
+        records.append(
+            eval_one_split("scaffold_cv", X, y, train_idx, test_idx, fold, outlier_idx)
+        )
     return {
         "empty_scaffold_handling": "each empty-scaffold molecule assigned its own group",
         "empty_scaffold_count": empty_count,
@@ -224,7 +293,7 @@ def run_scaffold_cv(X, y, df) -> dict:
     }
 
 
-def run_source_splits(X, y, df) -> dict:
+def run_source_splits(X, y, df, outlier_idx: np.ndarray | None = None) -> dict:
     source = df["source_kind"].astype(str).to_numpy()
     baseline_idx = np.flatnonzero(source == "baseline")
     agent_idx = np.flatnonzero(source == "agent")
@@ -232,19 +301,37 @@ def run_source_splits(X, y, df) -> dict:
         raise ValueError("source split requires non-empty baseline and agent sets")
 
     records = [
-        eval_one_split("source_split", X, y, baseline_idx, agent_idx, "baseline_to_agent"),
-        eval_one_split("source_split", X, y, agent_idx, baseline_idx, "agent_to_baseline"),
+        eval_one_split(
+            "source_split", X, y, baseline_idx, agent_idx,
+            "baseline_to_agent", outlier_idx
+        ),
+        eval_one_split(
+            "source_split", X, y, agent_idx, baseline_idx,
+            "agent_to_baseline", outlier_idx
+        ),
     ]
     return {"directions": records}
 
 
+def _scheme_line(label: str, summary: dict) -> str:
+    return (
+        f"{label:23s} "
+        f"{summary['mean_mae']:7.3f} +/- {summary['std_mae']:<7.3f} "
+        f"{summary['mean_r2']:7.3f} +/- {summary['std_r2']:<7.3f} "
+        f"{summary['mean_train_mean_baseline_mae']:7.3f} +/- "
+        f"{summary['std_train_mean_baseline_mae']:<7.3f}"
+    )
+
+
 def print_summary_table(results: dict) -> None:
-    print("\n=== Phase 3 ESP XGBoost Summary (concat features) ===")
-    print(f"Target: {TARGET} ({UNIT})")
+    short_name = results["target_config"]["short_name"]
+    noise = results["label_noise_floor"]
+    print(f"\n=== Phase 3 {short_name} XGBoost Summary (concat features) ===")
+    print(f"Target: {results['target']} ({UNIT})")
     print(
-        "DFT duplicate-label noise floor for ESP: "
-        f"median std={LABEL_NOISE_FLOOR['duplicate_std_median']:.2f} {UNIT}, "
-        f"mean std={LABEL_NOISE_FLOOR['duplicate_std_mean']:.2f} {UNIT}"
+        f"DFT duplicate-label noise floor for {short_name}: "
+        f"median std={noise['duplicate_std_median']:.2f} {UNIT}, "
+        f"mean std={noise['duplicate_std_mean']:.2f} {UNIT}"
     )
     print("\nScheme                  MAE mean +/- std      R2 mean +/- std       Train-mean MAE")
     print("-" * 86)
@@ -253,13 +340,14 @@ def print_summary_table(results: dict) -> None:
         ("scaffold_5fold_cv", "Scaffold 5-fold CV"),
     ]:
         s = results[key]["summary"]
-        print(
-            f"{label:23s} "
-            f"{s['mean_mae']:7.3f} +/- {s['std_mae']:<7.3f} "
-            f"{s['mean_r2']:7.3f} +/- {s['std_r2']:<7.3f} "
-            f"{s['mean_train_mean_baseline_mae']:7.3f} +/- "
-            f"{s['std_train_mean_baseline_mae']:<7.3f}"
-        )
+        print(_scheme_line(label, s))
+        if "diagnostic_mean_mae_excluding_global_outliers" in s:
+            print(
+                f"{'  diagnostic no-out':23s} "
+                f"{s['diagnostic_mean_mae_excluding_global_outliers']:7.3f} +/- "
+                f"{s['diagnostic_std_mae_excluding_global_outliers']:<7.3f} "
+                f"{'(MAE only; |z|>4 rows excluded from test metric)':>36s}"
+            )
     for rec in results["source_split"]["directions"]:
         print(
             f"Source {rec['fold']:16s} "
@@ -267,6 +355,13 @@ def print_summary_table(results: dict) -> None:
             f"{rec['r2']:7.3f} +/- {'NA':<7s} "
             f"{rec['train_mean_baseline_mae']:7.3f} +/- {'NA':<7s}"
         )
+        if "diagnostic_mae_excluding_global_outliers" in rec:
+            diag = rec["diagnostic_mae_excluding_global_outliers"]
+            diag_txt = "NA" if diag is None else f"{diag:.3f}"
+            print(
+                f"{'  diagnostic no-out':23s} {diag_txt:>7s} +/- {'NA':<7s} "
+                f"(MAE only; excluded {rec['diagnostic_n_outliers_excluded']} rows)"
+            )
 
     print("\nPer-fold MAE:")
     for key, label in [
@@ -285,25 +380,100 @@ def print_summary_table(results: dict) -> None:
         )
 
 
-def main() -> None:
-    df = load_unique_labels()
-    y = df[TARGET].to_numpy(dtype=np.float64)
-    X = load_concat_features(df)
+def comparison_row(results: dict) -> list[str]:
+    rand = results["random_5fold_cv"]["summary"]
+    scaf = results["scaffold_5fold_cv"]["summary"]
+    source = {r["fold"]: r for r in results["source_split"]["directions"]}
+    row = [
+        results["target_config"]["short_name"],
+        f"{rand['mean_mae']:.3f} +/- {rand['std_mae']:.3f}",
+        f"{scaf['mean_mae']:.3f} +/- {scaf['std_mae']:.3f}",
+        f"{source['baseline_to_agent']['mae']:.3f}",
+        f"{source['agent_to_baseline']['mae']:.3f}",
+    ]
+    if "diagnostic_mean_mae_excluding_global_outliers" in rand:
+        row.extend([
+            f"{rand['diagnostic_mean_mae_excluding_global_outliers']:.3f}",
+            f"{scaf['diagnostic_mean_mae_excluding_global_outliers']:.3f}",
+            f"{source['baseline_to_agent']['diagnostic_mae_excluding_global_outliers']:.3f}",
+            f"{source['agent_to_baseline']['diagnostic_mae_excluding_global_outliers']:.3f}",
+        ])
+    else:
+        row.extend(["NA", "NA", "NA", "NA"])
+    return row
 
-    print("Phase 3 ESP train/eval")
+
+def print_comparison_table(*results_objects: dict) -> None:
+    print("\n=== Phase 3 ESP vs Zn MAE Comparison (kcal/mol) ===")
+    header = (
+        f"{'Target':11s} {'Random CV':>18s} {'Scaffold CV':>18s} "
+        f"{'Base->Agent':>12s} {'Agent->Base':>12s} "
+        f"{'Rand no-out':>11s} {'Scaf no-out':>11s} "
+        f"{'B->A no-out':>11s} {'A->B no-out':>11s}"
+    )
+    print(header)
+    print("-" * len(header))
+    for results in results_objects:
+        row = comparison_row(results)
+        print(
+            f"{row[0]:11s} {row[1]:>18s} {row[2]:>18s} "
+            f"{row[3]:>12s} {row[4]:>12s} "
+            f"{row[5]:>11s} {row[6]:>11s} {row[7]:>11s} {row[8]:>11s}"
+        )
+
+
+def config_for_target(target: str) -> dict:
+    try:
+        return TARGET_CONFIGS[target]
+    except KeyError as exc:
+        choices = ", ".join(TARGET_CONFIGS)
+        raise SystemExit(f"unknown target {target!r}; choose one of: {choices}") from exc
+
+
+def normalize_loaded_results(results: dict) -> dict:
+    """Add target_config for metrics written before --target was introduced."""
+    if "target_config" not in results:
+        cfg = config_for_target(results["target"])
+        results["target_config"] = {
+            "short_name": cfg["short_name"],
+            "outlier_diagnostic": cfg["outlier_diagnostic"],
+        }
+    return results
+
+
+def run_target(target: str) -> dict:
+    cfg = config_for_target(target)
+    df = load_unique_labels()
+    y = df[target].to_numpy(dtype=np.float64)
+    X = load_concat_features(df)
+    outlier_idx = None
+    if cfg["outlier_diagnostic"]:
+        outlier_idx = outlier_indices_for_target(y)
+
+    print(f"Phase 3 {cfg['short_name']} train/eval")
     print(f"data_dir={DATA_DIR}")
     print(f"n_molecules={len(df)} X_shape={X.shape}")
-    print(f"target={TARGET} unit={UNIT}")
+    print(f"target={target} unit={UNIT}")
     print("model=XGBoost concat features; grid=max_depth {6,8} x lr {0.05,0.1}")
     print("early_stopping=50 on a held-out slice of each training fold")
     print(
         "reference_noise_floor="
-        f"median_duplicate_std {LABEL_NOISE_FLOOR['duplicate_std_median']} {UNIT}, "
-        f"mean_duplicate_std {LABEL_NOISE_FLOOR['duplicate_std_mean']} {UNIT}"
+        f"median_duplicate_std {cfg['label_noise_floor']['duplicate_std_median']} {UNIT}, "
+        f"mean_duplicate_std {cfg['label_noise_floor']['duplicate_std_mean']} {UNIT}"
     )
+    if outlier_idx is not None:
+        print(
+            "diagnostic_outliers="
+            f"{len(outlier_idx)} global |z|>4 rows; kept in headline train/eval, "
+            "excluded only for secondary MAE lines"
+        )
 
     results = {
-        "target": TARGET,
+        "target": target,
+        "target_config": {
+            "short_name": cfg["short_name"],
+            "outlier_diagnostic": cfg["outlier_diagnostic"],
+        },
         "unit": UNIT,
         "features": "concat",
         "model": "xgb",
@@ -316,18 +486,56 @@ def main() -> None:
             "tree_method": "hist",
             "n_jobs": -1,
         },
-        "label_noise_floor": LABEL_NOISE_FLOOR,
+        "label_noise_floor": cfg["label_noise_floor"],
+        "global_outlier_diagnostic": None if outlier_idx is None else {
+            "rule": "|z| > 4 on the full deduped target distribution",
+            "n_outliers": int(len(outlier_idx)),
+            "indices": [int(i) for i in outlier_idx],
+            "canonical_smiles": df.iloc[outlier_idx]["canonical_smiles"].tolist(),
+            "target_values": [float(v) for v in y[outlier_idx]],
+            "note": "Outliers are genuine signal and remain in headline training/evaluation.",
+        },
         "n_molecules": int(len(df)),
         "n_features": int(X.shape[1]),
-        "random_5fold_cv": run_random_cv(X, y),
-        "scaffold_5fold_cv": run_scaffold_cv(X, y, df),
-        "source_split": run_source_splits(X, y, df),
+        "random_5fold_cv": run_random_cv(X, y, outlier_idx),
+        "scaffold_5fold_cv": run_scaffold_cv(X, y, df, outlier_idx),
+        "source_split": run_source_splits(X, y, df, outlier_idx),
     }
 
-    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RESULTS_PATH.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
-    print(f"\nSaved metrics: {RESULTS_PATH}")
+    result_path = cfg["result_path"]
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
+    print(f"\nSaved metrics: {result_path}")
     print_summary_table(results)
+    return results
+
+
+def maybe_print_esp_zn_comparison(current_results: dict) -> None:
+    candidates = []
+    for target, cfg in TARGET_CONFIGS.items():
+        path = cfg["result_path"]
+        if path.exists():
+            candidates.append(normalize_loaded_results(json.loads(path.read_text())))
+        elif current_results["target"] == target:
+            candidates.append(current_results)
+    # Keep order stable: ESP first, Zn second, no duplicates.
+    by_target = {r["target"]: r for r in candidates}
+    ordered = [by_target[t] for t in TARGET_CONFIGS if t in by_target]
+    if len(ordered) >= 2:
+        print_comparison_table(*ordered)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Train/evaluate Phase 3 DFT targets.")
+    ap.add_argument(
+        "--target",
+        default="esp_vmin_mean_kcal_per_mol",
+        choices=sorted(TARGET_CONFIGS),
+        help="Target column to evaluate. Default preserves the original ESP run.",
+    )
+    args = ap.parse_args()
+    results = run_target(args.target)
+    maybe_print_esp_zn_comparison(results)
 
 
 if __name__ == "__main__":
