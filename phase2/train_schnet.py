@@ -190,6 +190,7 @@ def load_and_validate_splits(splits_dir: Path, split: str) -> tuple[dict, str, d
         path = splits_dir / name
         part_rows = read_split_csv(path)
         smiles = [r["canonical_smiles"] for r in part_rows]
+        mol_ids = [r.get("mol_id", "") for r in part_rows]
         expected = manifest["files"][name]
         actual_hash = smiles_sha256(smiles)
         if len(part_rows) != expected["row_count"]:
@@ -198,6 +199,8 @@ def load_and_validate_splits(splits_dir: Path, split: str) -> tuple[dict, str, d
                 f"{expected['row_count']}")
         if actual_hash != expected["canonical_smiles_sha256"]:
             raise SystemExit(f"{name}: canonical_smiles sha256 mismatch")
+        if "mol_id_sha256" in expected and smiles_sha256(mol_ids) != expected["mol_id_sha256"]:
+            raise SystemExit(f"{name}: mol_id sha256 mismatch")
         rows[part] = part_rows
 
     return rows, manifest_hash, manifest
@@ -211,52 +214,56 @@ def pyg_smiles(data) -> str:
     return str(data.smiles)
 
 
-def build_pyg_index(dataset: QM9) -> tuple[dict, dict, dict, dict]:
-    block_mapping = {}
-    full_mapping = {}
-    idx_to_block = {}
-    skipped = 0
-    fallback_recovered = 0
-    graph_recovered = 0
-    collision_count = 0
-    skipped_examples = []
+def pyg_mol_id(data) -> str | None:
+    """Stable QM9 GDB id exposed by PyG, e.g. 'gdb_1'.
+
+    The probe confirmed that data.name is the field matching our exported
+    split CSV mol_id values. data.idx is intentionally not used because it is
+    an internal PyG index, not the GDB molecule number.
+    """
+    name = getattr(data, "name", None)
+    if name is None:
+        return None
+    return str(name)
+
+
+def build_pyg_index(dataset: QM9) -> tuple[dict[str, int], dict[int, str], dict]:
+    name_to_idx: dict[str, int] = {}
+    idx_to_name: dict[int, str] = {}
+    duplicate_count = 0
+    missing_name_count = 0
+    duplicate_examples = []
+    missing_name_examples = []
+
     for i, data in enumerate(dataset):
-        raw = pyg_smiles(data)
-        try:
-            key, used_fallback = mol_key_with_status(raw)
-        except Exception:
-            key, used_fallback = None, False
-        if key is None:
-            key = mol_key_from_pyg_graph(data)
-            if key is None:
-                skipped += 1
-                if len(skipped_examples) < 5:
-                    skipped_examples.append(raw)
-                continue
-            graph_recovered += 1
-        if used_fallback:
-            fallback_recovered += 1
-        block = connectivity_key(key)
-        if block is None:
-            skipped += 1
-            if len(skipped_examples) < 5:
-                skipped_examples.append(raw)
+        name = pyg_mol_id(data)
+        if not name:
+            missing_name_count += 1
+            if len(missing_name_examples) < 5:
+                missing_name_examples.append(i)
             continue
-        full_mapping.setdefault(key, i)
-        if block in block_mapping:
-            collision_count += 1
-        else:
-            block_mapping[block] = i
-        idx_to_block[i] = block
+        if name in name_to_idx:
+            duplicate_count += 1
+            if len(duplicate_examples) < 5:
+                duplicate_examples.append({
+                    "mol_id": name,
+                    "first_index": int(name_to_idx[name]),
+                    "duplicate_index": int(i),
+                })
+            continue
+        name_to_idx[name] = i
+        idx_to_name[i] = name
+
     stats = {
-        "pyg_unparseable_skipped": int(skipped),
-        "pyg_fallback_recovered": int(fallback_recovered),
-        "pyg_graph_recovered": int(graph_recovered),
-        "pyg_connectivity_collision_count": int(collision_count),
-        "pyg_skipped_examples": skipped_examples,
+        "pyg_qm9_size": int(len(dataset)),
+        "pyg_named_count": int(len(name_to_idx)),
+        "pyg_missing_name_count": int(missing_name_count),
+        "pyg_duplicate_name_count": int(duplicate_count),
+        "pyg_duplicate_name_examples": duplicate_examples,
+        "pyg_missing_name_examples": missing_name_examples,
     }
-    print(json.dumps({"pyg_mol_key_indexing": stats}, indent=2, sort_keys=True))
-    return block_mapping, full_mapping, idx_to_block, stats
+    print(json.dumps({"pyg_name_indexing": stats}, indent=2, sort_keys=True))
+    return name_to_idx, idx_to_name, stats
 
 
 def split_keys(split_rows):
@@ -284,6 +291,36 @@ def matched_indices(split_rows, pyg_by_block):
     _, blocks, failed, intra_collision_rows = split_keys(split_rows)
     idx = [pyg_by_block[k] for k in blocks if k in pyg_by_block]
     return idx, blocks, failed, intra_collision_rows
+
+
+def split_mol_ids(split_rows: list[dict[str, str]], part: str) -> list[str]:
+    mol_ids = [r.get("mol_id", "") for r in split_rows]
+    missing = [i for i, mol_id in enumerate(mol_ids) if not mol_id]
+    if missing:
+        raise SystemExit(
+            f"{part} split has {len(missing)} rows with missing mol_id; "
+            f"first indices: {missing[:10]}"
+        )
+    counts = Counter(mol_ids)
+    duplicates = sorted(mol_id for mol_id, count in counts.items() if count > 1)
+    if duplicates:
+        raise SystemExit(
+            f"{part} split has {len(duplicates)} duplicate mol_id values; "
+            f"first duplicates: {duplicates[:10]}"
+        )
+    return mol_ids
+
+
+def match_mol_ids(mol_ids: list[str], name_to_idx: dict[str, int]) -> tuple[list[int], list[str]]:
+    matched = []
+    missing = []
+    for mol_id in mol_ids:
+        idx = name_to_idx.get(mol_id)
+        if idx is None:
+            missing.append(mol_id)
+        else:
+            matched.append(idx)
+    return matched, missing
 
 
 def subset_indices(indices: list[int], n: int, seed: int) -> list[int]:
@@ -351,77 +388,59 @@ def main() -> None:
         Path(args.splits_dir), args.split)
 
     dataset = QM9(root=args.data_root)
-    pyg_by_block, pyg_by_full, pyg_idx_to_block, pyg_index_stats = build_pyg_index(dataset)
+    pyg_by_name, pyg_idx_to_name, pyg_index_stats = build_pyg_index(dataset)
 
-    train_full_keys, train_blocks, train_key_failures, train_collision_rows = (
-        split_keys(split_rows["train"]))
-    val_full_keys, val_blocks, val_key_failures, val_collision_rows = split_keys(
-        split_rows["val"])
-    test_full_keys, test_blocks, test_key_failures, test_collision_rows = split_keys(
-        split_rows["test"])
+    train_mol_ids = split_mol_ids(split_rows["train"], "train")
+    val_mol_ids = split_mol_ids(split_rows["val"], "val")
+    test_mol_ids = split_mol_ids(split_rows["test"], "test")
 
-    split_collision_rows = {
-        "train": int(train_collision_rows),
-        "val": int(val_collision_rows),
-        "test": int(test_collision_rows),
-    }
-    for part, collision_rows in split_collision_rows.items():
-        n_part = len(split_rows[part])
-        if collision_rows / n_part > 0.01:
-            raise SystemExit(
-                f"{part} split has {collision_rows}/{n_part} "
-                "connectivity-key collision rows (>1%); stopping before "
-                "training because the match key is not safe enough")
+    train_idx_raw, train_missing = match_mol_ids(train_mol_ids, pyg_by_name)
+    val_idx, val_missing = match_mol_ids(val_mol_ids, pyg_by_name)
+    test_idx, test_missing = match_mol_ids(test_mol_ids, pyg_by_name)
 
-    train_idx = [pyg_by_block[k] for k in train_blocks if k in pyg_by_block]
-    val_idx = [pyg_by_block[k] for k in val_blocks if k in pyg_by_block]
-    test_idx = [pyg_by_block[k] for k in test_blocks if k in pyg_by_block]
-
-    train_full_match_count = sum(1 for k in train_full_keys if k in pyg_by_full)
-    val_full_match_count = sum(1 for k in val_full_keys if k in pyg_by_full)
-    test_full_match_count = sum(1 for k in test_full_keys if k in pyg_by_full)
-
-    val_test_blocks = set(val_blocks) | set(test_blocks)
+    val_test_mol_ids = set(val_mol_ids) | set(test_mol_ids)
     train_idx = [
-        i for i in train_idx
-        if pyg_idx_to_block[i] not in val_test_blocks
+        i for i in train_idx_raw
+        if pyg_idx_to_name[i] not in val_test_mol_ids
     ]
+    train_excluded_val_test_overlap = len(train_idx_raw) - len(train_idx)
     matched_train_count_before_subset = len(train_idx)
     train_idx = subset_indices(train_idx, args.train_subset, args.seed)
     if not train_idx or not val_idx or not test_idx:
         raise SystemExit(
-            "empty train/val/test intersection after matching PyG QM9 to "
-            "the frozen split CSVs")
+            "empty train/val/test intersection after matching PyG QM9 "
+            "data.name to frozen split mol_id values")
 
     coverage = {
         "pyg_qm9_size": int(len(dataset)),
         "frozen_train_count": int(len(split_rows["train"])),
         "frozen_val_count": int(len(split_rows["val"])),
         "frozen_test_count": int(len(split_rows["test"])),
-        "split_train_key_failures": int(train_key_failures),
-        "split_val_key_failures": int(val_key_failures),
-        "split_test_key_failures": int(test_key_failures),
-        "split_train_connectivity_collision_rows": int(train_collision_rows),
-        "split_val_connectivity_collision_rows": int(val_collision_rows),
-        "split_test_connectivity_collision_rows": int(test_collision_rows),
-        "matched_train_count_full_key": int(train_full_match_count),
-        "matched_val_count_full_key": int(val_full_match_count),
-        "matched_test_count_full_key": int(test_full_match_count),
-        "matched_train_count_before_subset": int(matched_train_count_before_subset),
-        "matched_train_count_used": int(len(train_idx)),
+        "matching_key": "PyG data.name == frozen split mol_id",
+        "split_train_duplicate_mol_id_count": 0,
+        "split_val_duplicate_mol_id_count": 0,
+        "split_test_duplicate_mol_id_count": 0,
+        "missing_train_mol_id_count": int(len(train_missing)),
+        "missing_val_mol_id_count": int(len(val_missing)),
+        "missing_test_mol_id_count": int(len(test_missing)),
+        "missing_train_mol_id_examples": train_missing[:10],
+        "missing_val_mol_id_examples": val_missing[:10],
+        "missing_test_mol_id_examples": test_missing[:10],
+        "matched_train_count_raw": int(len(train_idx_raw)),
         "matched_val_count": int(len(val_idx)),
         "matched_test_count": int(len(test_idx)),
+        "train_excluded_val_test_mol_id_overlap": int(train_excluded_val_test_overlap),
+        "matched_train_count_before_subset": int(matched_train_count_before_subset),
+        "matched_train_count_used": int(len(train_idx)),
         "test_coverage_fraction": float(len(test_idx) / len(split_rows["test"])),
-        "full_key_coverage": float(test_full_match_count / len(split_rows["test"])),
-        "first_block_coverage": float(len(test_idx) / len(split_rows["test"])),
         **pyg_index_stats,
     }
     print(json.dumps({"coverage": coverage}, indent=2, sort_keys=True))
     if coverage["test_coverage_fraction"] < 0.95:
         raise SystemExit(
-            "test coverage below 0.95 after PyG SMILES matching; this looks "
-            "like a systematic canonicalization mismatch, not a few "
-            "unparseable PyG molecules")
+            "test coverage below 0.95 after exact PyG data.name <-> frozen "
+            "mol_id matching; this suggests the expected GDB ids are not "
+            "aligned")
 
     train_loader = DataLoader(dataset[train_idx], batch_size=args.batch_size,
                               shuffle=True)
