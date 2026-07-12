@@ -1,0 +1,18 @@
+{
+  "best_epoch": 95,
+  "epochs_ran": 100,
+  "frozen_test_count": 13381,
+  "matched_test_count": 13107,
+  "matching_key": "PyG data.name == frozen split mol_id",
+  "model": "schnet",
+  "note": "Same frozen seed=42 split and manifest as Phase 1; SchNet on PyG QM9 3D coords.",
+  "split": "random",
+  "target": "gap",
+  "test_coverage_fraction": 0.9795232045437561,
+  "test_mae": 0.11562611162662506,
+  "test_r2": 0.9833806157112122,
+  "train_subset": 50000,
+  "unit": "eV",
+  "val_mae": 0.1147826686501503,
+  "val_r2": 0.980876624584198
+}

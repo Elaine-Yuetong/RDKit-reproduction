@@ -30,5 +30,8 @@ Literature values are random-split, ~110k training molecules; our runs use 107,0
 ## 4. Relevance to the additive project
 The same Phase 1 pipeline is built to run on an in-house DFT table by changing the CLI inputs, for example `python -m src.train --csv dft_additives.csv --target binding_energy`. For a 10^2-10^3 molecule additive dataset, the recommended first model is descriptors + XGBoost with scaffold-split evaluation: it is data-efficient, does not require a 3D geometry workflow, and was the strongest or near-strongest Phase 1 model across targets. If the dataset is at the small end (a few hundred molecules), we will switch evaluation from a single held-out split to repeated cross-validation to keep error estimates reliable.
 
-## 5. Next
-Phase 2 assets are ready for a Colab SchNet reproduction using the frozen split artifacts in `data/splits/`. In parallel, the next practical in-house step is chemprop on the additive DFT data, because it works from SMILES, supports small datasets, and gives a learned 2D baseline between RDKit descriptors and 3D SchNet.
+## 5. Phase 2 (complete)
+The learned-representation model was reproduced on Colab with SchNet, using PyG QM9 3D coordinates and the same frozen random-split test set. With 50,000 training molecules, SchNet reaches 0.116 eV gap MAE (R2 = 0.983), beating the Phase-1 hand-crafted-feature XGBoost concat baseline of 0.136 eV with less than half the training data. This quantifies the hand-crafted -> learned representations story from the Mena review with our own numbers. The remaining gap to the literature SchNet value of ~0.063 eV is expected because that reference used ~110k training molecules and longer schedules.
+
+## 6. Next
+In parallel, the next practical in-house step is chemprop on the additive DFT data, because it works from SMILES, supports small datasets, and gives a learned 2D baseline between RDKit descriptors and 3D SchNet.

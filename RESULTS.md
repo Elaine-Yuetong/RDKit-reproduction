@@ -18,10 +18,13 @@
 | XGBoost + Morgan FP | 0.1934 | 0.3841 | ours |
 | XGBoost + concat | 0.1364 | 0.2904 | ours |
 | RandomForest + concat | 0.1569 | 0.3163 | ours |
+| SchNet (3D, 50k train, ours) | 0.1156 | -- | ours |
 | — Literature reference — | | | |
 | Plain 2D GNN (Morris 1-GNN), full QM9 | ~0.121 | — | lit. |
 | SchNet (3D, ~110k train) | ~0.063 | — | Schütt 2018 |
 | GNN consensus band (SchNet/MPNN/MEGNet) | 0.06–0.09 | — | lit. |
+
+SchNet trained on 50,000 QM9 molecules (vs 107,038 for our XGBoost and ~110k in the literature), evaluated on the identical frozen random-split test set via gdb mol_id matching (coverage 0.98). It beats the XGBoost concat baseline (0.1364) with less than half the training data, and approaches the literature SchNet value (~0.063) which used ~110k molecules and longer schedules.
 
 Expected zone for our rows: **0.25–0.5 eV** on random split; scaffold split worse.
 If far outside this band, check (in order): Hartree→eV conversion, target
