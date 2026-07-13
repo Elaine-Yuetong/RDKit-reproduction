@@ -33,5 +33,19 @@ The same Phase 1 pipeline is built to run on an in-house DFT table by changing t
 ## 5. Phase 2 (complete)
 The learned-representation model was reproduced on Colab with SchNet, using PyG QM9 3D coordinates and the same frozen random-split test set. With 50,000 training molecules, SchNet reaches 0.116 eV gap MAE (R2 = 0.983), beating the Phase-1 hand-crafted-feature XGBoost concat baseline of 0.136 eV with less than half the training data. This quantifies the hand-crafted -> learned representations story from the Mena review with our own numbers. The remaining gap to the literature SchNet value of ~0.063 eV is expected because that reference used ~110k training molecules and longer schedules.
 
+## Phase 3 Task 1: Property prediction under the mentor's train/test split
+Per the mentor's instruction, the deployment split trains on the three PubChem-derived baseline sets and tests on the agent-exploration campaigns. This gives 2,140 baseline molecules for training and 1,523 agent molecules for testing. The two sets are chemically disjoint at the canonical-SMILES level, with zero overlap verified, so this is a genuine test of generalization to novel chemistry and mirrors the real additive-screening use case.
+
+| Target | Random 5-fold CV MAE | Random CV R2 | Mentor split MAE | Mentor split R2 |
+|---|---:|---:|---:|---:|
+| ESP minimum (kcal/mol) | 7.35 | 0.82 | 18.74 | 0.18 |
+| Zn binding (kcal/mol) | 18.94 | 0.25 | 23.37 | 0.09 |
+
+Cross-source prediction is substantially harder than random cross-validation for both targets. The random split measures interpolation among molecules drawn from the same source mixture, while the mentor split asks whether PubChem-trained models transfer to the agent-discovered chemistry.
+
+The key finding is that the cross-source difficulty is not uniform; it is concentrated in the exotic-element molecules the mentor cares about. For ESP, QM9-compatible agent molecules containing only C/N/O/F (n=454) are predicted reasonably well, with MAE = 8.34 kcal/mol and R2 = 0.77. Exotic-element agent molecules (n=1,069) degrade to MAE = 23.16 kcal/mol and R2 = -0.03, and the sulfur-containing subset (n=690) is worse still at MAE = 25.17 kcal/mol and R2 = -0.24. In plain terms, hand-crafted descriptors plus XGBoost still work across sources for QM9-like molecules, but essentially fail on the S/P-rich electrolyte chemistry where R2 is near zero or negative.
+
+This quantifies the limit of the current descriptor-era approach and motivates Task 2: a learned 3D representation model that is trained on data containing S/P chemistry so it can represent the exotic-element regime directly. No Task 2 result is claimed yet; this section only establishes the baseline failure mode it needs to address.
+
 ## 6. Next
 In parallel, the next practical in-house step is chemprop on the additive DFT data, because it works from SMILES, supports small datasets, and gives a learned 2D baseline between RDKit descriptors and 3D SchNet.
