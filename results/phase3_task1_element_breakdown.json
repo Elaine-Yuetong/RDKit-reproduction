@@ -1,0 +1,133 @@
+{
+  "n_features": 2247,
+  "n_molecules": 3663,
+  "qm9_compatible_elements": [
+    "C",
+    "F",
+    "N",
+    "O"
+  ],
+  "seed": 42,
+  "source_kind_counts": {
+    "agent": 1523,
+    "baseline": 2140
+  },
+  "targets": [
+    {
+      "best_params": {
+        "learning_rate": 0.1,
+        "max_depth": 8
+      },
+      "features": "concat",
+      "groups": [
+        {
+          "group": "all_agent_test",
+          "mae": 18.74244292817411,
+          "n": 1523,
+          "r2": 0.18227845365084783,
+          "train_mean_baseline_mae": 26.155658233207127,
+          "train_mean_baseline_r2": -0.3749068100314903
+        },
+        {
+          "group": "qm9_compat_test",
+          "mae": 8.340887324772638,
+          "n": 454,
+          "r2": 0.7698328887583076,
+          "train_mean_baseline_mae": 16.26136411338466,
+          "train_mean_baseline_r2": -0.08963669317997569
+        },
+        {
+          "group": "exotic_test",
+          "mae": 23.159941753192136,
+          "n": 1069,
+          "r2": -0.02787503157323412,
+          "train_mean_baseline_mae": 30.357725146583558,
+          "train_mean_baseline_r2": -0.5546867653892043
+        },
+        {
+          "group": "exotic_S_only_test",
+          "mae": 25.165583684931217,
+          "n": 690,
+          "r2": -0.2379877684656846,
+          "train_mean_baseline_mae": 30.521576585398893,
+          "train_mean_baseline_r2": -0.6740249848695199
+        }
+      ],
+      "inner_val_mae": 7.385154073483476,
+      "model": "xgb",
+      "n_estimators": 172,
+      "n_test": 1523,
+      "n_train": 2140,
+      "reproduction_check": {
+        "current_mae": 18.74244292817411,
+        "current_r2": 0.18227845365084783,
+        "mae_abs_diff": 0.0,
+        "matches_saved_within_1e-6": true,
+        "r2_abs_diff": 0.0,
+        "saved_mae": 18.74244292817411,
+        "saved_r2": 0.18227845365084783
+      },
+      "split": "baseline_to_agent",
+      "target": "esp_vmin_mean_kcal_per_mol",
+      "unit": "kcal/mol"
+    },
+    {
+      "best_params": {
+        "learning_rate": 0.1,
+        "max_depth": 8
+      },
+      "features": "concat",
+      "groups": [
+        {
+          "group": "all_agent_test",
+          "mae": 23.366602308932922,
+          "n": 1523,
+          "r2": 0.0915156686129609,
+          "train_mean_baseline_mae": 25.390162465835918,
+          "train_mean_baseline_r2": -0.0035855339158186172
+        },
+        {
+          "group": "qm9_compat_test",
+          "mae": 19.27164732066342,
+          "n": 454,
+          "r2": 0.21430272434322628,
+          "train_mean_baseline_mae": 22.123737267025486,
+          "train_mean_baseline_r2": -0.020575397539621898
+        },
+        {
+          "group": "exotic_test",
+          "mae": 25.10571322069565,
+          "n": 1069,
+          "r2": 0.03250086051776013,
+          "train_mean_baseline_mae": 26.777400108735762,
+          "train_mean_baseline_r2": -0.01865434151328005
+        },
+        {
+          "group": "exotic_S_only_test",
+          "mae": 25.045430088978005,
+          "n": 690,
+          "r2": -0.04607560320290949,
+          "train_mean_baseline_mae": 27.12321990508135,
+          "train_mean_baseline_r2": -0.11530345337904646
+        }
+      ],
+      "inner_val_mae": 16.89367606483887,
+      "model": "xgb",
+      "n_estimators": 46,
+      "n_test": 1523,
+      "n_train": 2140,
+      "reproduction_check": {
+        "current_mae": 23.366602308932922,
+        "current_r2": 0.0915156686129609,
+        "mae_abs_diff": 0.0,
+        "matches_saved_within_1e-6": true,
+        "r2_abs_diff": 0.0,
+        "saved_mae": 23.366602308932922,
+        "saved_r2": 0.0915156686129609
+      },
+      "split": "baseline_to_agent",
+      "target": "zn_e_bind_mean_kcal_per_mol",
+      "unit": "kcal/mol"
+    }
+  ]
+}
