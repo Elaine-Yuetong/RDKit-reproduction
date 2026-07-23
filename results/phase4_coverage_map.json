@@ -1,0 +1,558 @@
+{
+  "bin_edges": {
+    "esp_vmin_mean_kcal_per_mol": [
+      -154.63533333333334,
+      -132.7592857142857,
+      -110.88323809523808,
+      -89.00719047619047,
+      -67.13114285714285,
+      -45.25509523809522,
+      -23.37904761904761,
+      -1.503
+    ],
+    "zn_e_bind_mean_kcal_per_mol": [
+      -232.96637792938375,
+      -199.61591886071923,
+      -166.26545979205468,
+      -132.91500072339016,
+      -99.56454165472564,
+      -66.21408258606112,
+      -32.863623517396576,
+      0.4868355512679509
+    ]
+  },
+  "entropy_normalization": "Shannon H=-sum(p*ln(p)); normalized_entropy=H/ln(49)",
+  "global_cell_counts": [
+    [
+      0,
+      0,
+      2,
+      14,
+      9,
+      11,
+      4
+    ],
+    [
+      0,
+      1,
+      4,
+      44,
+      52,
+      78,
+      26
+    ],
+    [
+      1,
+      0,
+      3,
+      37,
+      52,
+      82,
+      34
+    ],
+    [
+      2,
+      5,
+      13,
+      60,
+      205,
+      141,
+      17
+    ],
+    [
+      2,
+      12,
+      37,
+      206,
+      817,
+      819,
+      50
+    ],
+    [
+      0,
+      4,
+      7,
+      51,
+      233,
+      368,
+      77
+    ],
+    [
+      0,
+      3,
+      1,
+      1,
+      6,
+      33,
+      39
+    ]
+  ],
+  "global_occupied_cells": 43,
+  "mentor_reference_note": "Mentor-reported values used a related coverage figure: agent 34 cells / entropy 0.73, PubChem 17 / 0.47, ECFP 27 / 0.63. Exact values here can differ because bin edges and source deduping are explicit.",
+  "n_bins": 7,
+  "n_molecules": 3663,
+  "ordering_reproduces_mentor_trend": true,
+  "ordering_verdict": "PASS: ordering reproduces the mentor trend (agent highest coverage/entropy, PubChem random HT lowest entropy).",
+  "per_source": {
+    "ECFP max-min": {
+      "cell_counts": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1,
+          3,
+          1,
+          2
+        ],
+        [
+          0,
+          0,
+          2,
+          1,
+          4,
+          3,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          9,
+          33,
+          21,
+          2
+        ],
+        [
+          0,
+          0,
+          6,
+          38,
+          134,
+          149,
+          10
+        ],
+        [
+          0,
+          0,
+          3,
+          5,
+          54,
+          81,
+          21
+        ],
+        [
+          0,
+          0,
+          0,
+          1,
+          0,
+          2,
+          13
+        ]
+      ],
+      "n_molecules": 600,
+      "normalized_entropy": 0.585629964017729,
+      "occupied_cells": 26,
+      "shannon_entropy_natural_log": 2.2791665811459936
+    },
+    "PubChem random HT": {
+      "cell_counts": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          3,
+          3,
+          3,
+          0
+        ],
+        [
+          0,
+          0,
+          4,
+          11,
+          48,
+          35,
+          1
+        ],
+        [
+          0,
+          0,
+          15,
+          87,
+          361,
+          263,
+          16
+        ],
+        [
+          0,
+          0,
+          0,
+          18,
+          72,
+          52,
+          6
+        ],
+        [
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "n_molecules": 999,
+      "normalized_entropy": 0.49042675381585027,
+      "occupied_cells": 18,
+      "shannon_entropy_natural_log": 1.9086527952370291
+    },
+    "agent": {
+      "cell_counts": [
+        [
+          0,
+          0,
+          2,
+          14,
+          9,
+          11,
+          4
+        ],
+        [
+          0,
+          1,
+          3,
+          41,
+          49,
+          77,
+          24
+        ],
+        [
+          1,
+          0,
+          1,
+          33,
+          41,
+          75,
+          33
+        ],
+        [
+          2,
+          4,
+          6,
+          36,
+          113,
+          71,
+          14
+        ],
+        [
+          2,
+          9,
+          15,
+          50,
+          216,
+          286,
+          17
+        ],
+        [
+          0,
+          3,
+          2,
+          13,
+          60,
+          108,
+          25
+        ],
+        [
+          0,
+          3,
+          0,
+          0,
+          6,
+          21,
+          22
+        ]
+      ],
+      "n_molecules": 1523,
+      "normalized_entropy": 0.7569842075196572,
+      "occupied_cells": 41,
+      "shannon_entropy_natural_log": 2.9460465041741886
+    },
+    "descriptor-farthest": {
+      "cell_counts": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          2,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          4,
+          1,
+          1
+        ],
+        [
+          0,
+          0,
+          3,
+          4,
+          11,
+          15,
+          0
+        ],
+        [
+          0,
+          3,
+          2,
+          33,
+          110,
+          131,
+          9
+        ],
+        [
+          0,
+          1,
+          2,
+          15,
+          58,
+          138,
+          31
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          10,
+          12
+        ]
+      ],
+      "n_molecules": 597,
+      "normalized_entropy": 0.5685104799363597,
+      "occupied_cells": 23,
+      "shannon_entropy_natural_log": 2.2125406255049387
+    }
+  },
+  "source_group_diagnostics": {
+    "multi_source_examples": [
+      {
+        "canonical_smiles": "C#CC1SP(=S)(N(C)C)N(C)C1C#C",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 17
+      },
+      {
+        "canonical_smiles": "C#CCOP(O)(=S)S",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 40
+      },
+      {
+        "canonical_smiles": "C12C3C4N1C1N2N3N41",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 54
+      },
+      {
+        "canonical_smiles": "C1=C2SSN=C2N=C2NSSC=12",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 60
+      },
+      {
+        "canonical_smiles": "C1=CC=CC=COON=CC=CC=C1",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 76
+      },
+      {
+        "canonical_smiles": "C1=CP1P1C=C1",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 89
+      },
+      {
+        "canonical_smiles": "C1=CPOC(N=NC2=CC=CPO2)=C1",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 90
+      },
+      {
+        "canonical_smiles": "C1COP2OCCOC(O1)OCCO2",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 171
+      },
+      {
+        "canonical_smiles": "C=P",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 303
+      },
+      {
+        "canonical_smiles": "CC(C)S1(C(C)C)SP1(O)(O)S",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 583
+      },
+      {
+        "canonical_smiles": "CC1C(=O)OC(=O)C1CC(C)(C)PP",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 790
+      },
+      {
+        "canonical_smiles": "CC=CP(C)CC",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 853
+      },
+      {
+        "canonical_smiles": "CC[NH2+]CCN(CC)C(=S)[S-]",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 1364
+      },
+      {
+        "canonical_smiles": "CN(C)C(F)(F)C(C(F)(F)F)C(F)(F)F",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 1418
+      },
+      {
+        "canonical_smiles": "CNC(=S)NN=CC(C)=NNC(=S)NC",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 1522
+      },
+      {
+        "canonical_smiles": "CP(C)(F)(F)P(C)(C)(F)F",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 1892
+      },
+      {
+        "canonical_smiles": "CP=O",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 1915
+      },
+      {
+        "canonical_smiles": "CSP(C)P(C)(C)=S",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 2017
+      },
+      {
+        "canonical_smiles": "C[N+](C)(C=C(C#N)C#N)P(N)([O-])=S",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 2091
+      },
+      {
+        "canonical_smiles": "Cc1cc(PP)cc(P(P)P)c1",
+        "groups": [
+          "ECFP max-min",
+          "descriptor-farthest"
+        ],
+        "row_index": 2419
+      }
+    ],
+    "multi_source_molecule_count": 56,
+    "unique_molecules": 3663
+  },
+  "source_groups": [
+    "agent",
+    "PubChem random HT",
+    "ECFP max-min",
+    "descriptor-farthest"
+  ],
+  "targets": {
+    "x": "esp_vmin_mean_kcal_per_mol",
+    "y": "zn_e_bind_mean_kcal_per_mol"
+  }
+}
