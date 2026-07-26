@@ -204,18 +204,35 @@ def mae_r2(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     return {"mae": mae, "r2": r2}
 
 
-def run_epoch(model, loader, optimizer, mean: float, std: float, device, torch) -> float:
+def run_epoch(
+    model,
+    loader,
+    optimizer,
+    mean: float,
+    std: float,
+    device,
+    torch,
+    grad_clip: float = 0.0,
+) -> float:
     model.train()
     losses = []
+    skipped_batches = 0
     for batch in loader:
         batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
         pred_norm = forward_model(model, batch)
         y_norm = (batch.y.view(-1) - mean) / std
         loss = torch.nn.functional.l1_loss(pred_norm, y_norm)
+        if not torch.isfinite(loss):
+            skipped_batches += 1
+            continue
         loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         losses.append(float(loss.detach().cpu()))
+    if skipped_batches:
+        print(f"WARNING: skipped {skipped_batches} non-finite-loss batches this epoch")
     return float(np.mean(losses)) if losses else float("nan")
 
 
@@ -300,7 +317,16 @@ def train_one_split(
     patience_left = args.patience
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(model, train_loader, optimizer, target_mean, target_std, device, torch)
+        train_loss = run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            target_mean,
+            target_std,
+            device,
+            torch,
+            args.grad_clip,
+        )
         y_val, pred_val = predict(model, val_loader, target_mean, target_std, device, torch)
         val_mae = mae_r2(y_val, pred_val)["mae"]
         if val_mae < best_val:
@@ -464,6 +490,12 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=0.0,
+        help="Max gradient norm. 0 disables clipping and preserves default behavior.",
+    )
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--val_frac", type=float, default=0.2)
     parser.add_argument("--hidden_channels", type=int, default=128)
@@ -508,6 +540,7 @@ def main() -> None:
         "requested_hparams="
         f"hidden_channels={args.hidden_channels}, num_layers={args.num_layers}, "
         f"num_rbf={args.num_rbf}, cutoff={args.cutoff}, max_z={args.max_z}, "
+        f"grad_clip={args.grad_clip}, "
         f"max_num_neighbors={args.max_num_neighbors}, "
         f"dimenet_num_blocks={args.dimenet_num_blocks}, "
         f"dimenet_int_emb_size={args.dimenet_int_emb_size}, "
