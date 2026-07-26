@@ -1,4 +1,4 @@
-"""Train/evaluate a PaiNN-style 3D predictor on Phase 4 DFT structures.
+"""Train/evaluate a 3D GNN predictor on Phase 4 DFT structures.
 
 This script is intended for a GPU box with PyTorch Geometric installed. It is
 kept self-contained and consumes the plain-Python cache produced by:
@@ -105,59 +105,28 @@ def records_to_data(records: list[dict[str, Any]], target: str, torch, Data) -> 
 
 
 def make_model(args, torch):
-    """Build PaiNN if available; otherwise fall back loudly to SchNet."""
+    """Build the selected PyG 3D model."""
     from torch_geometric.nn.models import SchNet
 
-    model_hparams = {
-        "hidden_channels": args.hidden_channels,
-        "num_layers": args.num_layers,
-        "cutoff": args.cutoff,
-        "num_rbf": args.num_rbf,
-        "max_z": args.max_z,
-    }
+    if args.model == "dimenetpp":
+        from torch_geometric.nn.models import DimeNetPlusPlus
 
-    try:
-        from torch_geometric.nn.models import PaiNN
-    except ImportError:
-        PaiNN = None
+        dimenet_kwargs = {
+            "hidden_channels": args.hidden_channels,
+            "out_channels": 1,
+            "num_blocks": args.dimenet_num_blocks,
+            "int_emb_size": args.dimenet_int_emb_size,
+            "basis_emb_size": args.dimenet_basis_emb_size,
+            "out_emb_channels": args.dimenet_out_emb_channels,
+            "num_spherical": args.dimenet_num_spherical,
+            "num_radial": args.dimenet_num_radial,
+            "cutoff": args.cutoff,
+            "max_num_neighbors": args.max_num_neighbors,
+        }
+        model = DimeNetPlusPlus(**dimenet_kwargs)
+        print(f"model_class=DimeNetPlusPlus hparams={dimenet_kwargs}")
+        return model, "DimeNetPlusPlus", dimenet_kwargs
 
-    if PaiNN is not None:
-        attempts = [
-            {
-                "hidden_channels": args.hidden_channels,
-                "out_channels": 1,
-                "num_layers": args.num_layers,
-                "num_rbf": args.num_rbf,
-                "cutoff": args.cutoff,
-                "max_z": args.max_z,
-            },
-            {
-                "hidden_channels": args.hidden_channels,
-                "num_layers": args.num_layers,
-                "num_rbf": args.num_rbf,
-                "cutoff": args.cutoff,
-                "max_z": args.max_z,
-            },
-            {
-                "hidden_channels": args.hidden_channels,
-                "out_channels": 1,
-                "num_layers": args.num_layers,
-                "cutoff": args.cutoff,
-                "max_z": args.max_z,
-            },
-        ]
-        errors = []
-        for kwargs in attempts:
-            try:
-                model = PaiNN(**kwargs)
-                print(f"model_class=PaiNN hparams={kwargs}")
-                return model, "PaiNN", kwargs
-            except TypeError as exc:
-                errors.append(str(exc))
-        print("WARNING: torch_geometric.nn.models.PaiNN exists but constructor failed.")
-        print(f"WARNING: PaiNN constructor errors: {errors}")
-
-    print("WARNING: PaiNN is unavailable; falling back to SchNet for this run.")
     schnet_kwargs = {
         "hidden_channels": args.hidden_channels,
         "num_filters": args.hidden_channels,
@@ -209,6 +178,9 @@ def forward_model(model, batch) -> Any:
     out = model(batch.z, batch.pos, batch.batch)
     if isinstance(out, tuple):
         out = out[0]
+    # SchNet returns [num_graphs] or [num_graphs, 1] depending on version;
+    # DimeNet++ with out_channels=1 returns [num_graphs, 1]. Flattening is the
+    # intended scalar-per-graph shape for both.
     return out.view(-1)
 
 
@@ -482,6 +454,12 @@ def main() -> None:
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--out_dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--target", choices=sorted(TARGETS), required=True)
+    parser.add_argument(
+        "--model",
+        choices=["schnet", "dimenetpp"],
+        default="schnet",
+        help="PyG model class to train. Default keeps the existing SchNet behavior.",
+    )
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -493,6 +471,13 @@ def main() -> None:
     parser.add_argument("--num_rbf", type=int, default=50)
     parser.add_argument("--cutoff", type=float, default=10.0)
     parser.add_argument("--max_z", type=int, default=100)
+    parser.add_argument("--max_num_neighbors", type=int, default=32)
+    parser.add_argument("--dimenet_num_blocks", type=int, default=4)
+    parser.add_argument("--dimenet_int_emb_size", type=int, default=64)
+    parser.add_argument("--dimenet_basis_emb_size", type=int, default=8)
+    parser.add_argument("--dimenet_out_emb_channels", type=int, default=256)
+    parser.add_argument("--dimenet_num_spherical", type=int, default=7)
+    parser.add_argument("--dimenet_num_radial", type=int, default=6)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--smoke", action="store_true", help="Fast GPU-box gate: small subset/few epochs.")
@@ -518,10 +503,18 @@ def main() -> None:
     print(f"cache={args.cache}")
     print(f"out_dir={args.out_dir}")
     print(f"device={device}")
+    print(f"selected_model={args.model}")
     print(
         "requested_hparams="
         f"hidden_channels={args.hidden_channels}, num_layers={args.num_layers}, "
-        f"num_rbf={args.num_rbf}, cutoff={args.cutoff}, max_z={args.max_z}"
+        f"num_rbf={args.num_rbf}, cutoff={args.cutoff}, max_z={args.max_z}, "
+        f"max_num_neighbors={args.max_num_neighbors}, "
+        f"dimenet_num_blocks={args.dimenet_num_blocks}, "
+        f"dimenet_int_emb_size={args.dimenet_int_emb_size}, "
+        f"dimenet_basis_emb_size={args.dimenet_basis_emb_size}, "
+        f"dimenet_out_emb_channels={args.dimenet_out_emb_channels}, "
+        f"dimenet_num_spherical={args.dimenet_num_spherical}, "
+        f"dimenet_num_radial={args.dimenet_num_radial}"
     )
     print_xgb_reference(args.target)
 
