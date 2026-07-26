@@ -86,9 +86,16 @@ def load_records(cache_path: Path) -> list[dict[str, Any]]:
     return parsed
 
 
-def records_to_data(records: list[dict[str, Any]], target: str, torch, Data) -> list[Any]:
+def records_to_data(
+    records: list[dict[str, Any]],
+    target: str,
+    torch,
+    Data,
+    min_atom_dist: float,
+) -> list[Any]:
     target_key = TARGETS[target]["record_key"]
     dataset = []
+    dropped_row_ids = []
     for record in records:
         z = torch.tensor(record["z"], dtype=torch.long)
         pos = torch.tensor(record["pos"], dtype=torch.float)
@@ -96,11 +103,23 @@ def records_to_data(records: list[dict[str, Any]], target: str, torch, Data) -> 
             raise ValueError(f"row_id={record['row_id']} has bad pos shape {tuple(pos.shape)}")
         if z.numel() != pos.size(0):
             raise ValueError(f"row_id={record['row_id']} len(z) != len(pos)")
+        if min_atom_dist > 0 and pos.size(0) > 1:
+            pairwise_dist = torch.pdist(pos)
+            if pairwise_dist.numel() and float(pairwise_dist.min().item()) < min_atom_dist:
+                dropped_row_ids.append(int(record["row_id"]))
+                continue
         y = torch.tensor([float(record[target_key])], dtype=torch.float)
         data = Data(z=z, pos=pos, y=y)
         data.row_id = int(record["row_id"])
         data.source_kind = str(record["source_kind"])
         dataset.append(data)
+    if dropped_row_ids:
+        shown = dropped_row_ids[:20]
+        print(
+            "geometry filter: "
+            f"dropped {len(dropped_row_ids)} molecules with min atom distance < "
+            f"{min_atom_dist} A: row_ids={shown}"
+        )
     return dataset
 
 
@@ -368,8 +387,15 @@ def train_one_split(
             args.grad_clip,
         )
         y_val, pred_val = predict(model, val_loader, target_mean, target_std, device, torch)
-        val_mae = mae_r2(y_val, pred_val)["mae"]
-        if val_mae < best_val:
+        val_metrics = mae_r2(y_val, pred_val)
+        val_mae = val_metrics["mae"]
+        if not math.isfinite(val_mae):
+            print(
+                f"WARNING: non-finite val_mae at {split_name} fold={fold} "
+                f"epoch={epoch:03d}; skipping best-checkpoint update"
+            )
+            patience_left -= 1
+        elif val_mae < best_val:
             best_val = val_mae
             best_epoch = epoch
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -542,6 +568,12 @@ def main() -> None:
     parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--num_rbf", type=int, default=50)
     parser.add_argument("--cutoff", type=float, default=10.0)
+    parser.add_argument(
+        "--min_atom_dist",
+        type=float,
+        default=0.1,
+        help="Drop molecules with any pairwise atom distance below this Angstrom threshold.",
+    )
     parser.add_argument("--max_z", type=int, default=100)
     parser.add_argument("--max_num_neighbors", type=int, default=32)
     parser.add_argument("--dimenet_num_blocks", type=int, default=4)
@@ -566,7 +598,7 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     records = load_records(args.cache)
-    dataset = records_to_data(records, args.target, torch, Data)
+    dataset = records_to_data(records, args.target, torch, Data, args.min_atom_dist)
     dataset = maybe_smoke_subset(dataset, args)
     target_cfg = TARGETS[args.target]
 
@@ -579,7 +611,8 @@ def main() -> None:
     print(
         "requested_hparams="
         f"hidden_channels={args.hidden_channels}, num_layers={args.num_layers}, "
-        f"num_rbf={args.num_rbf}, cutoff={args.cutoff}, max_z={args.max_z}, "
+        f"num_rbf={args.num_rbf}, cutoff={args.cutoff}, "
+        f"min_atom_dist={args.min_atom_dist}, max_z={args.max_z}, "
         f"grad_clip={args.grad_clip}, "
         f"max_num_neighbors={args.max_num_neighbors}, "
         f"dimenet_num_blocks={args.dimenet_num_blocks}, "
