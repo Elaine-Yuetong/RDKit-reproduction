@@ -198,6 +198,16 @@ def normalize_targets(dataset: list[Any], indices: np.ndarray) -> tuple[float, f
 
 
 def mae_r2(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    finite = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.all(finite):
+        y_true = y_true[finite]
+        y_pred = y_pred[finite]
+    if len(y_true) == 0:
+        return {
+            "mae": float("nan"),
+            "r2": float("nan"),
+            "note": "no finite prediction/target pairs available for metric calculation",
+        }
     mae = float(np.mean(np.abs(y_true - y_pred)))
     denom = float(np.sum((y_true - y_true.mean()) ** 2))
     r2 = float("nan") if denom == 0 else float(1.0 - np.sum((y_true - y_pred) ** 2) / denom)
@@ -240,12 +250,42 @@ def predict(model, loader, mean: float, std: float, device, torch) -> tuple[np.n
     model.eval()
     y_true = []
     y_pred = []
+    total = 0
+    dropped = 0
+    bad_row_ids = []
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
             pred = forward_model(model, batch) * std + mean
-            y_pred.extend(pred.detach().cpu().numpy().astype(float).tolist())
-            y_true.extend(batch.y.view(-1).detach().cpu().numpy().astype(float).tolist())
+            y = batch.y.view(-1)
+            row_ids = getattr(batch, "row_id", None)
+            if row_ids is None:
+                row_ids_list = [None] * int(pred.numel())
+            elif hasattr(row_ids, "detach"):
+                row_ids_list = row_ids.detach().cpu().numpy().astype(int).tolist()
+            elif isinstance(row_ids, (list, tuple)):
+                row_ids_list = [int(v) for v in row_ids]
+            else:
+                row_ids_list = [int(row_ids)] * int(pred.numel())
+
+            finite = torch.isfinite(pred)
+            pred_cpu = pred.detach().cpu()
+            y_cpu = y.detach().cpu()
+            finite_cpu = finite.detach().cpu().numpy().astype(bool)
+            pred_list = pred_cpu.numpy().astype(float).tolist()
+            y_list = y_cpu.numpy().astype(float).tolist()
+            total += len(pred_list)
+            for ok, true_value, pred_value, row_id in zip(finite_cpu, y_list, pred_list, row_ids_list):
+                if ok:
+                    y_true.append(true_value)
+                    y_pred.append(pred_value)
+                else:
+                    dropped += 1
+                    if len(bad_row_ids) < 20:
+                        bad_row_ids.append(row_id)
+    if dropped:
+        print(f"WARNING: dropped {dropped} non-finite predictions during eval (of {total} total)")
+        print(f"bad row_ids (up to 20): {bad_row_ids}")
     return np.asarray(y_true, dtype=np.float64), np.asarray(y_pred, dtype=np.float64)
 
 
