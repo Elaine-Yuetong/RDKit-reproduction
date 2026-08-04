@@ -29,7 +29,6 @@ from rdkit.Chem import rdFingerprintGenerator
 from phase4_generation.coverage_map import ESP_TARGET, RESULT_PATH, ZN_TARGET, normalized_entropy
 from phase4_generation.train_painn import (
     DEFAULT_CACHE,
-    DEFAULT_OUT_DIR,
     SEED,
     TARGETS,
     forward_model,
@@ -250,6 +249,14 @@ def pick_by_diversity(pool_records: list[dict[str, Any]], n_pick: int, seed: int
     return _simple_maxmin_pick(fps, n_pick)
 
 
+def pick_by_random(pool_records: list[dict[str, Any]], n_pick: int, rng: np.random.Generator) -> list[int]:
+    """Pick a uniform random subset of pool indices without replacement."""
+    n_pick = min(n_pick, len(pool_records))
+    if n_pick <= 0:
+        return []
+    return [int(i) for i in rng.choice(len(pool_records), size=n_pick, replace=False)]
+
+
 def _records_to_prediction_data(records: list[dict[str, Any]], torch, Data) -> list[Any]:
     dataset = []
     for record in records:
@@ -434,6 +441,7 @@ def evaluate(
 
 def plot_sampling(
     pool_records: list[dict[str, Any]],
+    random_idx: list[int],
     diversity_idx: list[int],
     coverage_idx: list[int],
     grid: dict[str, Any],
@@ -442,6 +450,7 @@ def plot_sampling(
     import matplotlib.pyplot as plt
 
     pool_esp, pool_zn = _true_property_arrays(pool_records)
+    rand_esp, rand_zn = _true_property_arrays([pool_records[int(i)] for i in random_idx])
     div_esp, div_zn = _true_property_arrays([pool_records[int(i)] for i in diversity_idx])
     cov_esp, cov_zn = _true_property_arrays([pool_records[int(i)] for i in coverage_idx])
     x_edges = np.asarray(grid["bin_edges"][ESP_TARGET], dtype=np.float64)
@@ -450,10 +459,11 @@ def plot_sampling(
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     out_path = FIGURES_DIR / f"coverage_sampling_{args.scenario}_budget{args.budget}.png"
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharex=True, sharey=True)
     for ax, title, esp, zn, color in [
-        (axes[0], "structural diversity picked", div_esp, div_zn, "tab:orange"),
-        (axes[1], "eyes coverage picked", cov_esp, cov_zn, "tab:blue"),
+        (axes[0], "random picked", rand_esp, rand_zn, "tab:gray"),
+        (axes[1], "structural diversity picked", div_esp, div_zn, "tab:orange"),
+        (axes[2], "eyes coverage picked", cov_esp, cov_zn, "tab:blue"),
     ]:
         ax.scatter(pool_esp, pool_zn, s=8, c="0.85", alpha=0.35, linewidths=0, label="pool")
         ax.scatter(esp, zn, s=18, c=color, alpha=0.85, linewidths=0, label="picked")
@@ -482,17 +492,50 @@ def _load_grid(path: Path) -> dict[str, Any]:
     return grid
 
 
-def _print_summary(metrics: dict[str, Any]) -> None:
+def _mean_std(values: list[float]) -> dict[str, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {"mean": float("nan"), "std": float("nan")}
+    std = float(finite.std(ddof=1)) if finite.size > 1 else 0.0
+    return {"mean": float(finite.mean()), "std": std}
+
+
+def _aggregate_seed_results(seed_results: list[dict[str, Any]]) -> dict[str, Any]:
+    pickers = ["random", "structural_diversity", "eyes_coverage"]
+    aggregate: dict[str, Any] = {"pickers": {}, "eyes_pool_r2": {}}
+    for picker in pickers:
+        rows = [result["pickers"][picker] for result in seed_results]
+        aggregate["pickers"][picker] = {
+            "normalized_entropy": _mean_std([row["normalized_entropy"] for row in rows]),
+            "occupied_cells": _mean_std([row["occupied_cells"] for row in rows]),
+            "esp_range": _mean_std([row["property_range_spread"]["esp_range"] for row in rows]),
+            "zn_range": _mean_std([row["property_range_spread"]["zn_range"] for row in rows]),
+        }
+    aggregate["eyes_pool_r2"]["esp"] = _mean_std(
+        [result["eyes_pool_metrics"]["esp"]["r2"] for result in seed_results]
+    )
+    aggregate["eyes_pool_r2"]["zn"] = _mean_std(
+        [result["eyes_pool_metrics"]["zn"]["r2"] for result in seed_results]
+    )
+    return aggregate
+
+
+def _fmt_mean_std(stats: dict[str, float], digits: int = 4) -> str:
+    return f"{stats['mean']:.{digits}f}+/-{stats['std']:.{digits}f}"
+
+
+def _print_single_summary(metrics: dict[str, Any]) -> None:
     print("\nCoverage-sampling evaluation")
-    print(f"scenario={metrics['scenario']} budget={metrics['budget']}")
+    print(f"scenario={metrics['scenario']} seed={metrics['seed']} budget={metrics['budget']}")
     print(
-        f"seed={metrics['n_seed']} pool={metrics['n_pool']} "
+        f"seed_set={metrics['n_seed']} pool={metrics['n_pool']} "
         f"seed_frac={metrics['seed_frac']} grid_bins={metrics['n_bins']}x{metrics['n_bins']}"
     )
     print()
     print(f"{'picker':22s} {'occupied':>10s} {'H_norm':>10s} {'ESP_range':>11s} {'Zn_range':>11s}")
     print("-" * 70)
-    for name in ["structural_diversity", "eyes_coverage"]:
+    for name in ["random", "structural_diversity", "eyes_coverage"]:
         row = metrics["pickers"][name]
         spread = row["property_range_spread"]
         print(
@@ -508,11 +551,36 @@ def _print_summary(metrics: dict[str, Any]) -> None:
     )
 
 
+def _print_aggregate_summary(metrics: dict[str, Any]) -> None:
+    aggregate = metrics["aggregate"]
+    print("\nAggregate coverage-sampling summary")
+    print(
+        f"scenario={metrics['scenario']} budget={metrics['budget']} "
+        f"n_seeds={metrics['n_seeds']} seeds={metrics['seeds']}"
+    )
+    print()
+    print(f"{'picker':22s} {'H_norm(mean+/-std)':>22s} {'occupied(mean+/-std)':>24s}")
+    print("-" * 72)
+    for name in ["random", "structural_diversity", "eyes_coverage"]:
+        row = aggregate["pickers"][name]
+        print(
+            f"{name:22s} {_fmt_mean_std(row['normalized_entropy']):>22s} "
+            f"{_fmt_mean_std(row['occupied_cells'], digits=2):>24s}"
+        )
+    print()
+    print(
+        "eyes pool R2 mean+/-std: "
+        f"ESP {_fmt_mean_std(aggregate['eyes_pool_r2']['esp'])}; "
+        f"Zn {_fmt_mean_std(aggregate['eyes_pool_r2']['zn'])}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retrospective Phase 4 coverage-sampling eval.")
     parser.add_argument("--scenario", choices=["random", "source"], required=True)
     parser.add_argument("--budget", type=int, default=200)
     parser.add_argument("--seed_frac", type=float, default=0.3)
+    parser.add_argument("--n_seeds", type=int, default=1)
     parser.add_argument("--coverage_map", type=Path, default=RESULT_PATH)
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--out_dir", type=Path, default=DEFAULT_SAMPLING_OUT_DIR)
@@ -543,52 +611,64 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-    if args.smoke:
-        args.epochs = min(args.epochs, 3)
-        args.patience = min(args.patience, 3)
-        args.budget = min(args.budget, 30)
-
-    torch, Data, DataLoader = import_torch_stack()
-    set_seed(args.seed, torch)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}")
-    print("model=DimeNetPlusPlus eyes; pool pickers never use ground-truth labels")
-
-    grid = _load_grid(args.coverage_map)
+def run_one_seed(
+    args,
+    run_seed: int,
+    grid: dict[str, Any],
+    torch,
+    Data,
+    DataLoader,
+    device,
+    make_figure: bool,
+) -> dict[str, Any]:
+    """Run one full fair retrospective evaluation for a single RNG seed."""
+    run_args = SimpleNamespace(**vars(args))
+    run_args.seed = int(run_seed)
+    set_seed(run_args.seed, torch)
+    rng = np.random.default_rng(run_args.seed)
     n_bins = int(grid["n_bins"])
-    seed_records, pool_records = load_pool_and_seed(args.scenario, args, torch, Data)
-    if args.smoke:
-        rng = np.random.default_rng(args.seed)
-        seed_keep = rng.choice(len(seed_records), size=min(args.smoke_n, len(seed_records)), replace=False)
-        pool_keep = rng.choice(len(pool_records), size=min(args.smoke_n, len(pool_records)), replace=False)
+
+    print("\n" + "=" * 78)
+    print(f"starting coverage-sampling seed={run_args.seed}")
+    print("=" * 78)
+
+    seed_records, pool_records = load_pool_and_seed(run_args.scenario, run_args, torch, Data)
+    if run_args.smoke:
+        seed_keep = rng.choice(len(seed_records), size=min(run_args.smoke_n, len(seed_records)), replace=False)
+        pool_keep = rng.choice(len(pool_records), size=min(run_args.smoke_n, len(pool_records)), replace=False)
         seed_records = [seed_records[int(i)] for i in seed_keep]
         pool_records = [pool_records[int(i)] for i in pool_keep]
-        print(f"SMOKE mode: seed={len(seed_records)} pool={len(pool_records)} budget={args.budget}")
+        print(f"SMOKE mode: seed={len(seed_records)} pool={len(pool_records)} budget={run_args.budget}")
 
-    eyes_esp = train_eyes_on_seed(seed_records, "esp", args, torch, Data, DataLoader, device)
-    eyes_zn = train_eyes_on_seed(seed_records, "zn", args, torch, Data, DataLoader, device)
+    eyes_esp = train_eyes_on_seed(seed_records, "esp", run_args, torch, Data, DataLoader, device)
+    eyes_zn = train_eyes_on_seed(seed_records, "zn", run_args, torch, Data, DataLoader, device)
 
-    budget = min(args.budget, len(pool_records))
-    diversity_idx = pick_by_diversity(pool_records, budget, seed=args.seed)
+    budget = min(run_args.budget, len(pool_records))
+    random_idx = pick_by_random(pool_records, budget, rng)
+    diversity_idx = pick_by_diversity(pool_records, budget, seed=run_args.seed)
     coverage_idx, pool_predictions = pick_by_coverage(
-        pool_records, eyes_esp, eyes_zn, budget, grid, args, torch, Data, DataLoader, device
+        pool_records, eyes_esp, eyes_zn, budget, grid, run_args, torch, Data, DataLoader, device
     )
 
+    random_metrics = evaluate(random_idx, pool_records, grid)
     diversity_metrics = evaluate(diversity_idx, pool_records, grid)
     coverage_metrics = evaluate(coverage_idx, pool_records, grid, pool_predictions)
     eyes_pool_metrics = coverage_metrics.pop("eyes_pool_metrics")
-    fig_path = plot_sampling(pool_records, diversity_idx, coverage_idx, grid, args)
+    fig_path = (
+        plot_sampling(pool_records, random_idx, diversity_idx, coverage_idx, grid, run_args)
+        if make_figure
+        else None
+    )
 
     metrics = {
-        "scenario": args.scenario,
+        "scenario": run_args.scenario,
+        "seed": int(run_args.seed),
         "budget": int(budget),
-        "seed_frac": float(args.seed_frac),
+        "seed_frac": float(run_args.seed_frac),
         "n_seed": int(len(seed_records)),
         "n_pool": int(len(pool_records)),
         "n_bins": int(n_bins),
-        "coverage_map": str(args.coverage_map),
+        "coverage_map": str(run_args.coverage_map),
         "fairness": {
             "pickers_use_ground_truth": False,
             "ground_truth_revealed_only_in_evaluate": True,
@@ -600,24 +680,83 @@ def main() -> None:
         },
         "eyes_pool_metrics": eyes_pool_metrics,
         "pickers": {
+            "random": random_metrics,
             "structural_diversity": diversity_metrics,
             "eyes_coverage": coverage_metrics,
         },
-        "figure": str(fig_path),
+        "figure": str(fig_path) if fig_path is not None else None,
     }
+    _print_single_summary(metrics)
+    return metrics
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.n_seeds < 1:
+        raise ValueError("--n_seeds must be >= 1")
+    if args.smoke:
+        args.epochs = min(args.epochs, 3)
+        args.patience = min(args.patience, 3)
+        args.budget = min(args.budget, 30)
+
+    torch, Data, DataLoader = import_torch_stack()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device={device}")
+    print("model=DimeNetPlusPlus eyes; pool pickers never use ground-truth labels")
+
+    grid = _load_grid(args.coverage_map)
+    seeds = [int(args.seed + k) for k in range(args.n_seeds)]
+    seed_results = [
+        run_one_seed(args, run_seed, grid, torch, Data, DataLoader, device, make_figure=(i == 0))
+        for i, run_seed in enumerate(seeds)
+    ]
+    aggregate = _aggregate_seed_results(seed_results)
+    budget = int(seed_results[0]["budget"])
+
+    if args.n_seeds == 1:
+        metrics = {
+            **seed_results[0],
+            "n_seeds": 1,
+            "seeds": seeds,
+            "per_seed_results": seed_results,
+            "aggregate": aggregate,
+        }
+        filename = f"coverage_sampling_{args.scenario}_budget{budget}.json"
+        result_filename = f"phase4_coverage_sampling_{args.scenario}_budget{budget}.json"
+    else:
+        metrics = {
+            "scenario": args.scenario,
+            "budget": budget,
+            "seed_frac": float(args.seed_frac),
+            "n_seeds": int(args.n_seeds),
+            "seeds": seeds,
+            "n_bins": int(grid["n_bins"]),
+            "coverage_map": str(args.coverage_map),
+            "fairness": {
+                "pickers_use_ground_truth": False,
+                "ground_truth_revealed_only_in_evaluate": True,
+                "eyes_trained_only_on_seed": True,
+            },
+            "per_seed_results": seed_results,
+            "aggregate": aggregate,
+            "figure": seed_results[0]["figure"],
+        }
+        filename = f"coverage_sampling_{args.scenario}_budget{budget}_seeds{args.n_seeds}.json"
+        result_filename = f"phase4_coverage_sampling_{args.scenario}_budget{budget}_seeds{args.n_seeds}.json"
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    run_path = args.out_dir / f"coverage_sampling_{args.scenario}_budget{budget}.json"
-    result_path = RESULTS_DIR / f"phase4_coverage_sampling_{args.scenario}_budget{budget}.json"
+    run_path = args.out_dir / filename
+    result_path = RESULTS_DIR / result_filename
     payload = json.dumps(metrics, indent=2, sort_keys=True) + "\n"
     run_path.write_text(payload)
     result_path.write_text(payload)
 
-    _print_summary(metrics)
+    _print_aggregate_summary(metrics)
     print(f"saved_metrics={result_path}")
     print(f"saved_run_copy={run_path}")
-    print(f"saved_figure={fig_path}")
+    if metrics.get("figure"):
+        print(f"saved_figure={metrics['figure']}")
 
 
 if __name__ == "__main__":
