@@ -98,6 +98,30 @@ def load_pool_and_seed(scenario: str, args, torch, Data) -> tuple[list[dict[str,
     return _clone_records(seed_records), _clone_records(pool_records)
 
 
+def load_pool_and_exact_random_seed(
+    seed_size: int,
+    split_seed: int,
+    args,
+    torch,
+    Data,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build a random seed/pool split with exactly seed_size seed molecules."""
+    records = _geometry_filtered_records(args, torch, Data)
+    if seed_size < 1:
+        raise ValueError("seed_size must be >= 1")
+    if seed_size >= len(records):
+        raise ValueError(f"seed_size={seed_size} leaves no pool molecules from n={len(records)}")
+    rng = np.random.default_rng(split_seed)
+    order = rng.permutation(len(records))
+    seed_records = [records[int(i)] for i in order[:seed_size]]
+    pool_records = [records[int(i)] for i in order[seed_size:]]
+    print(
+        f"load_pool_and_exact_random_seed: split_seed={split_seed} "
+        f"seed_size={len(seed_records)} pool={len(pool_records)}"
+    )
+    return _clone_records(seed_records), _clone_records(pool_records)
+
+
 # ---------------------------------------------------------------------------
 # SECTION 2 - train_eyes_on_seed(seed_records, target, args)
 
@@ -552,6 +576,41 @@ def plot_iterative_rounds(
     return out_path
 
 
+def plot_sweep(metrics: dict[str, Any]) -> Path:
+    import matplotlib.pyplot as plt
+
+    seed_sizes = sorted([int(size) for size in metrics["aggregate"]], reverse=True)
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = FIGURES_DIR / "coverage_sampling_sweep.png"
+
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    for picker, label, color in [
+        ("random", "random", "tab:gray"),
+        ("structural_diversity", "structural diversity", "tab:orange"),
+        ("eyes_coverage", "eyes coverage", "tab:blue"),
+    ]:
+        means = [
+            metrics["aggregate"][str(size)]["pickers"][picker]["normalized_entropy"]["mean"]
+            for size in seed_sizes
+        ]
+        stds = [
+            metrics["aggregate"][str(size)]["pickers"][picker]["normalized_entropy"]["std"]
+            for size in seed_sizes
+        ]
+        ax.errorbar(seed_sizes, means, yerr=stds, marker="o", capsize=3, label=label, color=color)
+    ax.set_xscale("log")
+    ax.invert_xaxis()
+    ax.set_xlabel("seed size (DFT-labeled molecules)")
+    ax.set_ylabel("picked-set normalized entropy")
+    ax.set_title(f"Coverage-sampling seed-size sweep, budget={metrics['budget']}")
+    ax.legend(loc="best")
+    ax.grid(True, which="both", color="0.9", linewidth=0.7)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def _load_grid(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"missing coverage map JSON: {path}")
@@ -588,6 +647,38 @@ def _aggregate_seed_results(seed_results: list[dict[str, Any]]) -> dict[str, Any
     aggregate["eyes_pool_r2"]["zn"] = _mean_std(
         [result["eyes_pool_metrics"]["zn"]["r2"] for result in seed_results]
     )
+    return aggregate
+
+
+def _aggregate_sweep_results(per_rep: list[dict[str, Any]]) -> dict[str, Any]:
+    aggregate: dict[str, Any] = {}
+    seed_sizes = sorted({int(row["seed_size"]) for row in per_rep}, reverse=True)
+    for seed_size in seed_sizes:
+        rows = [row for row in per_rep if int(row["seed_size"]) == seed_size]
+        aggregate[str(seed_size)] = {
+            "n_reps": int(len(rows)),
+            "eyes_pool_r2": {
+                "esp": _mean_std([row["eyes_pool_metrics"]["esp"]["r2"] for row in rows]),
+                "zn": _mean_std([row["eyes_pool_metrics"]["zn"]["r2"] for row in rows]),
+            },
+            "pickers": {},
+        }
+        for picker in ["random", "structural_diversity", "eyes_coverage"]:
+            picker_rows = [row["pickers"][picker] for row in rows]
+            aggregate[str(seed_size)]["pickers"][picker] = {
+                "normalized_entropy": _mean_std(
+                    [picker_row["normalized_entropy"] for picker_row in picker_rows]
+                ),
+                "occupied_cells": _mean_std(
+                    [picker_row["occupied_cells"] for picker_row in picker_rows]
+                ),
+            }
+        random_h = aggregate[str(seed_size)]["pickers"]["random"]["normalized_entropy"]
+        coverage_h = aggregate[str(seed_size)]["pickers"]["eyes_coverage"]["normalized_entropy"]
+        aggregate[str(seed_size)]["coverage_minus_random_entropy"] = {
+            "mean": float(coverage_h["mean"] - random_h["mean"]),
+            "std": float(math.sqrt(coverage_h["std"] ** 2 + random_h["std"] ** 2)),
+        }
     return aggregate
 
 
@@ -675,15 +766,42 @@ def _print_iterative_summary(metrics: dict[str, Any]) -> None:
     )
 
 
+def _print_sweep_summary(metrics: dict[str, Any]) -> None:
+    print("\nSeed-size sweep summary")
+    print(
+        f"scenario=random budget={metrics['budget']} sweep_reps={metrics['sweep_reps']} "
+        f"base_seed={metrics['base_seed']}"
+    )
+    print()
+    print(
+        f"{'seed_size':>9s} {'eyesESP_R2':>17s} {'random_H':>17s} "
+        f"{'diversity_H':>17s} {'coverage_H':>17s} {'coverage-random':>17s}"
+    )
+    print("-" * 98)
+    for seed_size in metrics["seed_sizes"]:
+        row = metrics["aggregate"][str(seed_size)]
+        print(
+            f"{seed_size:9d} "
+            f"{_fmt_mean_std(row['eyes_pool_r2']['esp']):>17s} "
+            f"{_fmt_mean_std(row['pickers']['random']['normalized_entropy']):>17s} "
+            f"{_fmt_mean_std(row['pickers']['structural_diversity']['normalized_entropy']):>17s} "
+            f"{_fmt_mean_std(row['pickers']['eyes_coverage']['normalized_entropy']):>17s} "
+            f"{_fmt_mean_std(row['coverage_minus_random_entropy']):>17s}"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retrospective Phase 4 coverage-sampling eval.")
-    parser.add_argument("--scenario", choices=["random", "source"], required=True)
+    parser.add_argument("--scenario", choices=["random", "source"], default="random")
     parser.add_argument("--budget", type=int, default=200)
     parser.add_argument("--seed_frac", type=float, default=0.3)
     parser.add_argument("--n_seeds", type=int, default=1)
     parser.add_argument("--iterative", action="store_true")
     parser.add_argument("--round_budget", type=int, default=50)
     parser.add_argument("--n_rounds", type=int, default=4)
+    parser.add_argument("--sweep", action="store_true")
+    parser.add_argument("--sweep_sizes", default="1200,800,500,300,150,80,40")
+    parser.add_argument("--sweep_reps", type=int, default=3)
     parser.add_argument("--coverage_map", type=Path, default=RESULT_PATH)
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--out_dir", type=Path, default=DEFAULT_SAMPLING_OUT_DIR)
@@ -950,16 +1068,131 @@ def run_iterative(args, grid: dict[str, Any], torch, Data, DataLoader, device) -
     return metrics
 
 
+def _parse_sweep_sizes(value: str) -> list[int]:
+    sizes = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        size = int(part)
+        if size < 1:
+            raise ValueError(f"sweep seed size must be >= 1, got {size}")
+        sizes.append(size)
+    if not sizes:
+        raise ValueError("--sweep_sizes produced an empty list")
+    return sorted(dict.fromkeys(sizes), reverse=True)
+
+
+def run_sweep(args, grid: dict[str, Any], torch, Data, DataLoader, device) -> dict[str, Any]:
+    """Run exact-seed-size random-scenario sweep for smart sampling robustness."""
+    if args.sweep_reps < 1:
+        raise ValueError("--sweep_reps must be >= 1")
+    seed_sizes = _parse_sweep_sizes(args.sweep_sizes)
+    per_rep: list[dict[str, Any]] = []
+    n_bins = int(grid["n_bins"])
+
+    print("\nSeed-size sweep mode: forcing scenario=random")
+    print(f"seed_sizes={seed_sizes} sweep_reps={args.sweep_reps} budget={args.budget}")
+
+    for seed_size in seed_sizes:
+        for rep in range(args.sweep_reps):
+            run_seed = int(args.seed + rep)
+            run_args = SimpleNamespace(**vars(args))
+            run_args.scenario = "random"
+            run_args.seed = run_seed
+            set_seed(run_seed, torch)
+            rng = np.random.default_rng(run_seed)
+
+            print("\n" + "=" * 78)
+            print(f"sweep seed_size={seed_size} rep={rep + 1}/{args.sweep_reps} split_seed={run_seed}")
+            print("=" * 78)
+
+            seed_records, pool_records = load_pool_and_exact_random_seed(
+                seed_size, run_seed, run_args, torch, Data
+            )
+            eyes_esp = train_eyes_on_seed(seed_records, "esp", run_args, torch, Data, DataLoader, device)
+            eyes_zn = train_eyes_on_seed(seed_records, "zn", run_args, torch, Data, DataLoader, device)
+
+            pool_predictions = predict_pool_with_eyes(
+                pool_records, eyes_esp, eyes_zn, run_args, torch, Data, DataLoader, device
+            )
+            eyes_pool = _eyes_pool_metrics(pool_records, pool_predictions)
+
+            budget = min(run_args.budget, len(pool_records))
+            random_idx = pick_by_random(pool_records, budget, rng)
+            diversity_idx = pick_by_diversity(pool_records, budget, seed=run_seed)
+            coverage_idx, _ = pick_by_coverage(
+                pool_records,
+                eyes_esp,
+                eyes_zn,
+                budget,
+                grid,
+                run_args,
+                torch,
+                Data,
+                DataLoader,
+                device,
+                pool_predictions=pool_predictions,
+            )
+
+            random_metrics = evaluate(random_idx, pool_records, grid)
+            diversity_metrics = evaluate(diversity_idx, pool_records, grid)
+            coverage_metrics = evaluate(coverage_idx, pool_records, grid)
+            per_rep.append(
+                {
+                    "seed_size": int(seed_size),
+                    "rep": int(rep),
+                    "split_seed": int(run_seed),
+                    "budget": int(budget),
+                    "n_seed": int(len(seed_records)),
+                    "n_pool": int(len(pool_records)),
+                    "eyes_pool_metrics": eyes_pool,
+                    "pickers": {
+                        "random": random_metrics,
+                        "structural_diversity": diversity_metrics,
+                        "eyes_coverage": coverage_metrics,
+                    },
+                }
+            )
+
+    aggregate = _aggregate_sweep_results(per_rep)
+    metrics = {
+        "mode": "seed_size_sweep",
+        "scenario": "random",
+        "budget": int(args.budget),
+        "base_seed": int(args.seed),
+        "seed_sizes": seed_sizes,
+        "sweep_reps": int(args.sweep_reps),
+        "n_bins": int(n_bins),
+        "coverage_map": str(args.coverage_map),
+        "fairness": {
+            "pickers_use_ground_truth": False,
+            "ground_truth_revealed_only_in_evaluate": True,
+            "eyes_trained_only_on_seed": True,
+        },
+        "per_rep_results": per_rep,
+        "aggregate": aggregate,
+    }
+    fig_path = plot_sweep(metrics)
+    metrics["figure"] = str(fig_path)
+    _print_sweep_summary(metrics)
+    return metrics
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if args.n_seeds < 1:
         raise ValueError("--n_seeds must be >= 1")
+    if args.sweep and args.iterative:
+        raise ValueError("--sweep and --iterative are mutually exclusive")
     if args.smoke:
         args.epochs = min(args.epochs, 3)
         args.patience = min(args.patience, 3)
         args.budget = min(args.budget, 30)
         args.round_budget = min(args.round_budget, 10)
         args.n_rounds = min(args.n_rounds, 2)
+        args.sweep_sizes = ",".join(str(v) for v in _parse_sweep_sizes(args.sweep_sizes)[:2])
+        args.sweep_reps = min(args.sweep_reps, 1)
 
     torch, Data, DataLoader = import_torch_stack()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -967,6 +1200,21 @@ def main() -> None:
     print("model=DimeNetPlusPlus eyes; pool pickers never use ground-truth labels")
 
     grid = _load_grid(args.coverage_map)
+    if args.sweep:
+        args.scenario = "random"
+        metrics = run_sweep(args, grid, torch, Data, DataLoader, device)
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        run_path = args.out_dir / "coverage_sampling_sweep.json"
+        result_path = RESULTS_DIR / "phase4_coverage_sampling_sweep.json"
+        payload = json.dumps(metrics, indent=2, sort_keys=True) + "\n"
+        run_path.write_text(payload)
+        result_path.write_text(payload)
+        print(f"saved_metrics={result_path}")
+        print(f"saved_run_copy={run_path}")
+        print(f"saved_figure={metrics['figure']}")
+        return
+
     if args.iterative:
         metrics = run_iterative(args, grid, torch, Data, DataLoader, device)
         args.out_dir.mkdir(parents=True, exist_ok=True)
