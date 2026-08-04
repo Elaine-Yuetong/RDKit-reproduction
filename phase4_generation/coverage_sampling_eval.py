@@ -325,13 +325,18 @@ def pick_by_coverage(
     Data,
     DataLoader,
     device,
+    pool_predictions: dict[str, Any] | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     """Pick molecules from emptiest predicted ESP/Zn cells using only eyes outputs."""
     n_pick = min(n_pick, len(pool_records))
     if n_pick <= 0:
         return [], {"esp": [], "zn": []}
-    pred_esp = _predict_eye_values(pool_records, eyes_esp, args, torch, Data, DataLoader, device)
-    pred_zn = _predict_eye_values(pool_records, eyes_zn, args, torch, Data, DataLoader, device)
+    if pool_predictions is None:
+        pred_esp = _predict_eye_values(pool_records, eyes_esp, args, torch, Data, DataLoader, device)
+        pred_zn = _predict_eye_values(pool_records, eyes_zn, args, torch, Data, DataLoader, device)
+    else:
+        pred_esp = np.asarray(pool_predictions["esp"], dtype=np.float64)
+        pred_zn = np.asarray(pool_predictions["zn"], dtype=np.float64)
     finite = np.isfinite(pred_esp) & np.isfinite(pred_zn)
     if not np.any(finite):
         raise RuntimeError("coverage picker has no finite eyes predictions for the pool")
@@ -423,6 +428,23 @@ def _eyes_pool_metrics(pool_records: list[dict[str, Any]], pool_predictions: dic
     }
 
 
+def predict_pool_with_eyes(
+    pool_records: list[dict[str, Any]],
+    eyes_esp: dict[str, Any],
+    eyes_zn: dict[str, Any],
+    args,
+    torch,
+    Data,
+    DataLoader,
+    device,
+) -> dict[str, Any]:
+    """Predict ESP/Zn for a pool using current eyes, without using labels."""
+    return {
+        "esp": _predict_eye_values(pool_records, eyes_esp, args, torch, Data, DataLoader, device).tolist(),
+        "zn": _predict_eye_values(pool_records, eyes_zn, args, torch, Data, DataLoader, device).tolist(),
+    }
+
+
 def evaluate(
     picked_idx: list[int],
     pool_records: list[dict[str, Any]],
@@ -476,6 +498,54 @@ def plot_sampling(
         ax.legend(loc="best", fontsize=8)
     axes[0].set_ylabel("Zn binding (kcal/mol)")
     fig.suptitle(f"Retrospective coverage sampling: {args.scenario}, budget={args.budget}")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_iterative_rounds(
+    original_pool_records: list[dict[str, Any]],
+    picked_round_records: list[list[dict[str, Any]]],
+    grid: dict[str, Any],
+    args,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    pool_esp, pool_zn = _true_property_arrays(original_pool_records)
+    x_edges = np.asarray(grid["bin_edges"][ESP_TARGET], dtype=np.float64)
+    y_edges = np.asarray(grid["bin_edges"][ZN_TARGET], dtype=np.float64)
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = FIGURES_DIR / f"coverage_sampling_{args.scenario}_iterative.png"
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(pool_esp, pool_zn, s=8, c="0.88", alpha=0.35, linewidths=0, label="original pool")
+    cmap = plt.get_cmap("viridis", max(1, len(picked_round_records)))
+    for round_idx, records in enumerate(picked_round_records, start=1):
+        if not records:
+            continue
+        esp, zn = _true_property_arrays(records)
+        ax.scatter(
+            esp,
+            zn,
+            s=26,
+            color=cmap(round_idx - 1),
+            alpha=0.9,
+            linewidths=0,
+            label=f"round {round_idx}",
+        )
+    for edge in x_edges:
+        ax.axvline(edge, color="0.9", lw=0.7, zorder=0)
+    for edge in y_edges:
+        ax.axhline(edge, color="0.9", lw=0.7, zorder=0)
+    ax.set_xlabel("ESP minimum (kcal/mol)")
+    ax.set_ylabel("Zn binding (kcal/mol)")
+    ax.set_title(
+        f"Iterative coverage sampling: {args.scenario}, "
+        f"{args.n_rounds}x{args.round_budget}"
+    )
+    ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -575,12 +645,45 @@ def _print_aggregate_summary(metrics: dict[str, Any]) -> None:
     )
 
 
+def _print_iterative_summary(metrics: dict[str, Any]) -> None:
+    print("\nIterative coverage-sampling evaluation")
+    print(
+        f"scenario={metrics['scenario']} seed={metrics['seed']} "
+        f"round_budget={metrics['round_budget']} n_rounds={metrics['n_rounds']}"
+    )
+    print()
+    print(
+        f"{'round':>5s} {'n_seed':>8s} {'ESP_R2':>10s} {'Zn_R2':>10s} "
+        f"{'cum_n':>8s} {'cum_H_norm':>12s} {'cum_occupied':>13s}"
+    )
+    print("-" * 78)
+    for row in metrics["rounds"]:
+        print(
+            f"{row['round']:5d} {row['n_seed_so_far']:8d} "
+            f"{row['eyes_pool_r2']['esp']:10.4f} {row['eyes_pool_r2']['zn']:10.4f} "
+            f"{row['cumulative_picked_count']:8d} "
+            f"{row['cumulative_coverage']['normalized_entropy']:12.4f} "
+            f"{row['cumulative_coverage']['occupied_cells']:13d}"
+        )
+    iterative = metrics["iterative_final"]["normalized_entropy"]
+    single = metrics["single_shot_baseline"]["normalized_entropy"]
+    print()
+    print(
+        "final comparison: "
+        f"iterative cumulative H_norm={iterative:.4f} vs "
+        f"single-shot H_norm={single:.4f}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retrospective Phase 4 coverage-sampling eval.")
     parser.add_argument("--scenario", choices=["random", "source"], required=True)
     parser.add_argument("--budget", type=int, default=200)
     parser.add_argument("--seed_frac", type=float, default=0.3)
     parser.add_argument("--n_seeds", type=int, default=1)
+    parser.add_argument("--iterative", action="store_true")
+    parser.add_argument("--round_budget", type=int, default=50)
+    parser.add_argument("--n_rounds", type=int, default=4)
     parser.add_argument("--coverage_map", type=Path, default=RESULT_PATH)
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument("--out_dir", type=Path, default=DEFAULT_SAMPLING_OUT_DIR)
@@ -690,6 +793,163 @@ def run_one_seed(
     return metrics
 
 
+def _remove_indices(records: list[dict[str, Any]], selected_idx: list[int]) -> list[dict[str, Any]]:
+    selected = {int(i) for i in selected_idx}
+    return [record for i, record in enumerate(records) if i not in selected]
+
+
+def run_iterative(args, grid: dict[str, Any], torch, Data, DataLoader, device) -> dict[str, Any]:
+    """Run active-learning-style rounds with reveal/add/retrain after each batch."""
+    run_args = SimpleNamespace(**vars(args))
+    run_args.seed = int(args.seed)
+    set_seed(run_args.seed, torch)
+    rng = np.random.default_rng(run_args.seed)
+    n_bins = int(grid["n_bins"])
+
+    if run_args.round_budget < 1:
+        raise ValueError("--round_budget must be >= 1")
+    if run_args.n_rounds < 1:
+        raise ValueError("--n_rounds must be >= 1")
+
+    seed_records, remaining_pool = load_pool_and_seed(run_args.scenario, run_args, torch, Data)
+    if run_args.smoke:
+        seed_keep = rng.choice(len(seed_records), size=min(run_args.smoke_n, len(seed_records)), replace=False)
+        pool_keep = rng.choice(len(remaining_pool), size=min(run_args.smoke_n, len(remaining_pool)), replace=False)
+        seed_records = [seed_records[int(i)] for i in seed_keep]
+        remaining_pool = [remaining_pool[int(i)] for i in pool_keep]
+        print(
+            f"SMOKE iterative mode: seed={len(seed_records)} pool={len(remaining_pool)} "
+            f"round_budget={run_args.round_budget} n_rounds={run_args.n_rounds}"
+        )
+
+    original_seed_count = len(seed_records)
+    original_pool = _clone_records(remaining_pool)
+    total_single_shot_budget = min(run_args.round_budget * run_args.n_rounds, len(original_pool))
+    cumulative_picked: list[dict[str, Any]] = []
+    picked_round_records: list[list[dict[str, Any]]] = []
+    rounds: list[dict[str, Any]] = []
+    single_shot_baseline = None
+
+    for round_idx in range(1, run_args.n_rounds + 1):
+        if not remaining_pool:
+            print(f"stopping iterative loop early at round {round_idx}: remaining_pool is empty")
+            break
+
+        print("\n" + "=" * 78)
+        print(
+            f"iterative round={round_idx} seed_records={len(seed_records)} "
+            f"remaining_pool={len(remaining_pool)}"
+        )
+        print("=" * 78)
+
+        eyes_esp = train_eyes_on_seed(seed_records, "esp", run_args, torch, Data, DataLoader, device)
+        eyes_zn = train_eyes_on_seed(seed_records, "zn", run_args, torch, Data, DataLoader, device)
+
+        # Accuracy measurement uses labels only for reporting. These labels are
+        # not fed back into training until after the current batch is picked.
+        pool_predictions = predict_pool_with_eyes(
+            remaining_pool, eyes_esp, eyes_zn, run_args, torch, Data, DataLoader, device
+        )
+        eyes_pool = _eyes_pool_metrics(remaining_pool, pool_predictions)
+
+        if round_idx == 1:
+            single_idx, single_predictions = pick_by_coverage(
+                original_pool,
+                eyes_esp,
+                eyes_zn,
+                total_single_shot_budget,
+                grid,
+                run_args,
+                torch,
+                Data,
+                DataLoader,
+                device,
+                pool_predictions=pool_predictions if original_pool is remaining_pool else None,
+            )
+            single_shot_baseline = evaluate(single_idx, original_pool, grid, single_predictions)
+            single_shot_baseline["budget"] = int(total_single_shot_budget)
+
+        batch_budget = min(run_args.round_budget, len(remaining_pool))
+        picked_idx, _ = pick_by_coverage(
+            remaining_pool,
+            eyes_esp,
+            eyes_zn,
+            batch_budget,
+            grid,
+            run_args,
+            torch,
+            Data,
+            DataLoader,
+            device,
+            pool_predictions=pool_predictions,
+        )
+
+        # Reveal only the selected batch now: move it into the training seed for
+        # the next round. Unpicked pool labels remain unused by training.
+        batch_records = [remaining_pool[int(i)] for i in picked_idx]
+        cumulative_picked.extend(batch_records)
+        picked_round_records.append(batch_records)
+        remaining_pool = _remove_indices(remaining_pool, picked_idx)
+        seed_records.extend(batch_records)
+
+        cum_esp, cum_zn = _true_property_arrays(cumulative_picked)
+        cumulative_coverage = _cell_metrics(cum_esp, cum_zn, grid)
+        rounds.append(
+            {
+                "round": int(round_idx),
+                "n_seed_so_far": int(len(seed_records)),
+                "n_remaining_pool": int(len(remaining_pool)),
+                "eyes_pool_mae": {
+                    "esp": float(eyes_pool["esp"]["mae"]),
+                    "zn": float(eyes_pool["zn"]["mae"]),
+                },
+                "eyes_pool_r2": {
+                    "esp": float(eyes_pool["esp"]["r2"]),
+                    "zn": float(eyes_pool["zn"]["r2"]),
+                },
+                "picked_this_round": int(len(batch_records)),
+                "picked_row_ids": [int(record["row_id"]) for record in batch_records],
+                "cumulative_picked_count": int(len(cumulative_picked)),
+                "cumulative_coverage": cumulative_coverage,
+            }
+        )
+
+    if single_shot_baseline is None:
+        raise RuntimeError("iterative run did not produce a single-shot baseline")
+    fig_path = plot_iterative_rounds(original_pool, picked_round_records, grid, run_args)
+    iterative_final = rounds[-1]["cumulative_coverage"] if rounds else _cell_metrics(
+        np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64), grid
+    )
+
+    metrics = {
+        "mode": "iterative",
+        "scenario": run_args.scenario,
+        "seed": int(run_args.seed),
+        "round_budget": int(run_args.round_budget),
+        "n_rounds": int(run_args.n_rounds),
+        "total_single_shot_budget": int(total_single_shot_budget),
+        "seed_frac": float(run_args.seed_frac),
+        "n_original_seed": int(original_seed_count),
+        "n_original_pool": int(len(original_pool)),
+        "n_final_seed": int(len(seed_records)),
+        "n_final_remaining_pool": int(len(remaining_pool)),
+        "n_bins": int(n_bins),
+        "coverage_map": str(run_args.coverage_map),
+        "fairness": {
+            "pickers_use_ground_truth": False,
+            "ground_truth_revealed_only_after_batch_picked": True,
+            "eyes_trained_only_on_current_seed": True,
+            "single_shot_trained_only_on_original_seed": True,
+        },
+        "rounds": rounds,
+        "iterative_final": iterative_final,
+        "single_shot_baseline": single_shot_baseline,
+        "figure": str(fig_path),
+    }
+    _print_iterative_summary(metrics)
+    return metrics
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if args.n_seeds < 1:
@@ -698,6 +958,8 @@ def main() -> None:
         args.epochs = min(args.epochs, 3)
         args.patience = min(args.patience, 3)
         args.budget = min(args.budget, 30)
+        args.round_budget = min(args.round_budget, 10)
+        args.n_rounds = min(args.n_rounds, 2)
 
     torch, Data, DataLoader = import_torch_stack()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -705,6 +967,20 @@ def main() -> None:
     print("model=DimeNetPlusPlus eyes; pool pickers never use ground-truth labels")
 
     grid = _load_grid(args.coverage_map)
+    if args.iterative:
+        metrics = run_iterative(args, grid, torch, Data, DataLoader, device)
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        run_path = args.out_dir / f"coverage_sampling_{args.scenario}_iterative.json"
+        result_path = RESULTS_DIR / f"phase4_coverage_sampling_{args.scenario}_iterative.json"
+        payload = json.dumps(metrics, indent=2, sort_keys=True) + "\n"
+        run_path.write_text(payload)
+        result_path.write_text(payload)
+        print(f"saved_metrics={result_path}")
+        print(f"saved_run_copy={run_path}")
+        print(f"saved_figure={metrics['figure']}")
+        return
+
     seeds = [int(args.seed + k) for k in range(args.n_seeds)]
     seed_results = [
         run_one_seed(args, run_seed, grid, torch, Data, DataLoader, device, make_figure=(i == 0))
