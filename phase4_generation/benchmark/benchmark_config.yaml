@@ -1,0 +1,36 @@
+data:
+  cache: data/dft_real/painn_cache/painn_records.json.gz
+  min_atom_dist: 0.1
+
+grid:
+  coverage_map: results/phase4_coverage_map.json
+  n_bins: 7
+
+scenarios:
+  - random
+  - source
+
+pickers:
+  - random
+  - structural_diversity
+  - uncertainty_distance
+  - property_maxmin
+  - property_stratified
+  - eyes_coverage
+
+metrics:
+  - entropy
+  - occupied_cells
+  - mean_nn
+  - min_nn
+  - coverage_radius
+
+eval:
+  budget: 200
+  n_seeds: 3
+
+eyes:
+  model: dimenetpp
+  lr: 1.0e-4
+  grad_clip: 1.0
+  epochs: 100
