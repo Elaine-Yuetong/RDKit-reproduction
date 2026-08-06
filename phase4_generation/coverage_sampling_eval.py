@@ -57,6 +57,7 @@ PICKER_ORDER = [
     "property_stratified",
     "eyes_coverage",
 ]
+CONTINUOUS_METRICS = ["mean_nn_distance", "min_nn_distance", "coverage_radius"]
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +587,70 @@ def _cell_metrics(esp: np.ndarray, zn: np.ndarray, grid: dict[str, Any]) -> dict
     }
 
 
+def _continuous_property_metrics(
+    selected_esp: np.ndarray,
+    selected_zn: np.ndarray,
+    pool_esp: np.ndarray,
+    pool_zn: np.ndarray,
+) -> dict[str, Any]:
+    """Grid-free space-filling metrics in true ESP/Zn space.
+
+    Standardization is fit on the full pool's true properties. This function is
+    called only from evaluation/reporting paths, after labels are revealed.
+    """
+    pool_xy = np.column_stack([pool_esp, pool_zn]).astype(np.float64)
+    selected_xy = np.column_stack([selected_esp, selected_zn]).astype(np.float64)
+    finite_pool = pool_xy[np.all(np.isfinite(pool_xy), axis=1)]
+    finite_selected = selected_xy[np.all(np.isfinite(selected_xy), axis=1)]
+    if finite_pool.size == 0 or finite_selected.size == 0:
+        return {
+            "mean_nn_distance": float("nan"),
+            "min_nn_distance": float("nan"),
+            "coverage_radius": float("nan"),
+            "continuous_metric_standardization": "true pool ESP/Zn mean/std",
+        }
+
+    pool_z, mean, std = _standardize_xy(finite_pool)
+    selected_z = (finite_selected - mean) / std
+
+    if len(selected_z) < 2:
+        mean_nn = float("nan")
+        min_nn = float("nan")
+    else:
+        selected_dists = np.sqrt(
+            np.sum((selected_z[:, None, :] - selected_z[None, :, :]) ** 2, axis=2)
+        )
+        np.fill_diagonal(selected_dists, np.inf)
+        nearest_selected = selected_dists.min(axis=1)
+        mean_nn = float(nearest_selected.mean())
+        min_nn = float(nearest_selected.min())
+
+    nearest_pool = np.full(len(pool_z), np.inf, dtype=np.float64)
+    for start in range(0, len(pool_z), 512):
+        chunk = pool_z[start : start + 512]
+        dists = np.sqrt(np.sum((chunk[:, None, :] - selected_z[None, :, :]) ** 2, axis=2))
+        nearest_pool[start : start + len(chunk)] = dists.min(axis=1)
+
+    return {
+        "mean_nn_distance": mean_nn,
+        "min_nn_distance": min_nn,
+        "coverage_radius": float(nearest_pool.max()),
+        "continuous_metric_standardization": "true pool ESP/Zn mean/std",
+    }
+
+
+def _coverage_metrics_for_records(
+    selected_records: list[dict[str, Any]],
+    reference_records: list[dict[str, Any]],
+    grid: dict[str, Any],
+) -> dict[str, Any]:
+    selected_esp, selected_zn = _true_property_arrays(selected_records)
+    pool_esp, pool_zn = _true_property_arrays(reference_records)
+    metrics = _cell_metrics(selected_esp, selected_zn, grid)
+    metrics.update(_continuous_property_metrics(selected_esp, selected_zn, pool_esp, pool_zn))
+    return metrics
+
+
 def _eyes_pool_metrics(pool_records: list[dict[str, Any]], pool_predictions: dict[str, Any]) -> dict[str, Any]:
     true_esp, true_zn = _true_property_arrays(pool_records)
     pred_esp = np.asarray(pool_predictions["esp"], dtype=np.float64)
@@ -621,8 +686,7 @@ def evaluate(
 ) -> dict[str, Any]:
     """Reveal ground truth only here and score true property-space coverage."""
     picked_records = [pool_records[int(i)] for i in picked_idx]
-    esp, zn = _true_property_arrays(picked_records)
-    metrics = _cell_metrics(esp, zn, grid)
+    metrics = _coverage_metrics_for_records(picked_records, pool_records, grid)
     metrics["picked_row_ids"] = [int(record["row_id"]) for record in picked_records]
     if pool_predictions is not None:
         metrics["eyes_pool_metrics"] = _eyes_pool_metrics(pool_records, pool_predictions)
@@ -840,6 +904,8 @@ def _aggregate_seed_results(seed_results: list[dict[str, Any]]) -> dict[str, Any
             "esp_range": _mean_std([row["property_range_spread"]["esp_range"] for row in rows]),
             "zn_range": _mean_std([row["property_range_spread"]["zn_range"] for row in rows]),
         }
+        for metric in CONTINUOUS_METRICS:
+            aggregate["pickers"][picker][metric] = _mean_std([row[metric] for row in rows])
     aggregate["eyes_pool_r2"]["esp"] = _mean_std(
         [result["eyes_pool_metrics"]["esp"]["r2"] for result in seed_results]
     )
@@ -872,6 +938,10 @@ def _aggregate_sweep_results(per_rep: list[dict[str, Any]]) -> dict[str, Any]:
                     [picker_row["occupied_cells"] for picker_row in picker_rows]
                 ),
             }
+            for metric in CONTINUOUS_METRICS:
+                aggregate[str(seed_size)]["pickers"][picker][metric] = _mean_std(
+                    [picker_row[metric] for picker_row in picker_rows]
+                )
         random_h = aggregate[str(seed_size)]["pickers"]["random"]["normalized_entropy"]
         coverage_h = aggregate[str(seed_size)]["pickers"]["eyes_coverage"]["normalized_entropy"]
         aggregate[str(seed_size)]["coverage_minus_random_entropy"] = {
@@ -893,13 +963,19 @@ def _print_single_summary(metrics: dict[str, Any]) -> None:
         f"seed_frac={metrics['seed_frac']} grid_bins={metrics['n_bins']}x{metrics['n_bins']}"
     )
     print()
-    print(f"{'picker':22s} {'occupied':>10s} {'H_norm':>10s} {'ESP_range':>11s} {'Zn_range':>11s}")
-    print("-" * 70)
+    print(
+        f"{'picker':22s} {'occupied':>10s} {'H_norm':>10s} "
+        f"{'mean_NN':>10s} {'min_NN':>10s} {'cov_radius':>11s} "
+        f"{'ESP_range':>11s} {'Zn_range':>11s}"
+    )
+    print("-" * 107)
     for name in PICKER_ORDER:
         row = metrics["pickers"][name]
         spread = row["property_range_spread"]
         print(
             f"{name:22s} {row['occupied_cells']:10d} {row['normalized_entropy']:10.4f} "
+            f"{row['mean_nn_distance']:10.4f} {row['min_nn_distance']:10.4f} "
+            f"{row['coverage_radius']:11.4f} "
             f"{spread['esp_range']:11.4f} {spread['zn_range']:11.4f}"
         )
     eyes = metrics["eyes_pool_metrics"]
@@ -919,13 +995,20 @@ def _print_aggregate_summary(metrics: dict[str, Any]) -> None:
         f"n_seeds={metrics['n_seeds']} seeds={metrics['seeds']}"
     )
     print()
-    print(f"{'picker':22s} {'H_norm(mean+/-std)':>22s} {'occupied(mean+/-std)':>24s}")
-    print("-" * 72)
+    print(
+        f"{'picker':22s} {'H_norm(mean+/-std)':>22s} "
+        f"{'occupied(mean+/-std)':>24s} {'mean_NN':>17s} "
+        f"{'min_NN':>17s} {'cov_radius':>17s}"
+    )
+    print("-" * 130)
     for name in PICKER_ORDER:
         row = aggregate["pickers"][name]
         print(
             f"{name:22s} {_fmt_mean_std(row['normalized_entropy']):>22s} "
-            f"{_fmt_mean_std(row['occupied_cells'], digits=2):>24s}"
+            f"{_fmt_mean_std(row['occupied_cells'], digits=2):>24s} "
+            f"{_fmt_mean_std(row['mean_nn_distance']):>17s} "
+            f"{_fmt_mean_std(row['min_nn_distance']):>17s} "
+            f"{_fmt_mean_std(row['coverage_radius']):>17s}"
         )
     print()
     print(
@@ -944,16 +1027,20 @@ def _print_iterative_summary(metrics: dict[str, Any]) -> None:
     print()
     print(
         f"{'round':>5s} {'n_seed':>8s} {'ESP_R2':>10s} {'Zn_R2':>10s} "
-        f"{'cum_n':>8s} {'cum_H_norm':>12s} {'cum_occupied':>13s}"
+        f"{'cum_n':>8s} {'cum_H_norm':>12s} {'cum_occupied':>13s} "
+        f"{'cum_mean_NN':>12s} {'cum_cov_rad':>12s}"
     )
-    print("-" * 78)
+    print("-" * 106)
     for row in metrics["rounds"]:
+        coverage = row["cumulative_coverage"]
         print(
             f"{row['round']:5d} {row['n_seed_so_far']:8d} "
             f"{row['eyes_pool_r2']['esp']:10.4f} {row['eyes_pool_r2']['zn']:10.4f} "
             f"{row['cumulative_picked_count']:8d} "
-            f"{row['cumulative_coverage']['normalized_entropy']:12.4f} "
-            f"{row['cumulative_coverage']['occupied_cells']:13d}"
+            f"{coverage['normalized_entropy']:12.4f} "
+            f"{coverage['occupied_cells']:13d} "
+            f"{coverage['mean_nn_distance']:12.4f} "
+            f"{coverage['coverage_radius']:12.4f}"
         )
     iterative = metrics["iterative_final"]["normalized_entropy"]
     single = metrics["single_shot_baseline"]["normalized_entropy"]
@@ -973,22 +1060,26 @@ def _print_sweep_summary(metrics: dict[str, Any]) -> None:
     )
     print()
     print(
-        f"{'seed_size':>9s} {'eyesESP_R2':>17s} {'random_H':>17s} "
-        f"{'diversity_H':>17s} {'uncert_H':>17s} {'prop_maxmin_H':>17s} "
-        f"{'stratified_H':>17s} {'coverage_H':>17s} {'coverage-random':>17s}"
+        f"{'seed_size':>9s} {'picker':22s} {'eyesESP_R2':>17s} "
+        f"{'H_norm':>17s} {'occupied':>17s} {'mean_NN':>17s} "
+        f"{'min_NN':>17s} {'cov_radius':>17s}"
     )
-    print("-" * 170)
+    print("-" * 142)
     for seed_size in metrics["seed_sizes"]:
         row = metrics["aggregate"][str(seed_size)]
+        eyes_esp = _fmt_mean_std(row["eyes_pool_r2"]["esp"])
+        for picker in PICKER_ORDER:
+            picker_row = row["pickers"][picker]
+            print(
+                f"{seed_size:9d} {picker:22s} {eyes_esp:>17s} "
+                f"{_fmt_mean_std(picker_row['normalized_entropy']):>17s} "
+                f"{_fmt_mean_std(picker_row['occupied_cells'], digits=2):>17s} "
+                f"{_fmt_mean_std(picker_row['mean_nn_distance']):>17s} "
+                f"{_fmt_mean_std(picker_row['min_nn_distance']):>17s} "
+                f"{_fmt_mean_std(picker_row['coverage_radius']):>17s}"
+            )
         print(
-            f"{seed_size:9d} "
-            f"{_fmt_mean_std(row['eyes_pool_r2']['esp']):>17s} "
-            f"{_fmt_mean_std(row['pickers']['random']['normalized_entropy']):>17s} "
-            f"{_fmt_mean_std(row['pickers']['structural_diversity']['normalized_entropy']):>17s} "
-            f"{_fmt_mean_std(row['pickers']['uncertainty_distance']['normalized_entropy']):>17s} "
-            f"{_fmt_mean_std(row['pickers']['property_maxmin']['normalized_entropy']):>17s} "
-            f"{_fmt_mean_std(row['pickers']['property_stratified']['normalized_entropy']):>17s} "
-            f"{_fmt_mean_std(row['pickers']['eyes_coverage']['normalized_entropy']):>17s} "
+            f"{seed_size:9d} {'eyes_coverage-random':22s} {'':>17s} "
             f"{_fmt_mean_std(row['coverage_minus_random_entropy']):>17s}"
         )
 
@@ -1221,8 +1312,7 @@ def run_iterative(args, grid: dict[str, Any], torch, Data, DataLoader, device) -
         remaining_pool = _remove_indices(remaining_pool, picked_idx)
         seed_records.extend(batch_records)
 
-        cum_esp, cum_zn = _true_property_arrays(cumulative_picked)
-        cumulative_coverage = _cell_metrics(cum_esp, cum_zn, grid)
+        cumulative_coverage = _coverage_metrics_for_records(cumulative_picked, original_pool, grid)
         rounds.append(
             {
                 "round": int(round_idx),
@@ -1246,8 +1336,8 @@ def run_iterative(args, grid: dict[str, Any], torch, Data, DataLoader, device) -
     if single_shot_baseline is None:
         raise RuntimeError("iterative run did not produce a single-shot baseline")
     fig_path = plot_iterative_rounds(original_pool, picked_round_records, grid, run_args)
-    iterative_final = rounds[-1]["cumulative_coverage"] if rounds else _cell_metrics(
-        np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64), grid
+    iterative_final = rounds[-1]["cumulative_coverage"] if rounds else _coverage_metrics_for_records(
+        [], original_pool, grid
     )
 
     metrics = {
