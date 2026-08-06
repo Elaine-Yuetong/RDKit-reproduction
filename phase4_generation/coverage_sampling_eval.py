@@ -49,6 +49,14 @@ FIGURES_DIR = ROOT / "phase4_generation" / "figures"
 DEFAULT_SAMPLING_OUT_DIR = ROOT / "phase4_generation" / "coverage_sampling_runs"
 FP_SIZE = 2048
 FP_RADIUS = 2
+PICKER_ORDER = [
+    "random",
+    "structural_diversity",
+    "uncertainty_distance",
+    "property_maxmin",
+    "property_stratified",
+    "eyes_coverage",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +289,142 @@ def pick_by_random(pool_records: list[dict[str, Any]], n_pick: int, rng: np.rand
     return [int(i) for i in rng.choice(len(pool_records), size=n_pick, replace=False)]
 
 
+def _prediction_matrix(pool_predictions: dict[str, Any]) -> np.ndarray:
+    esp = np.asarray(pool_predictions["esp"], dtype=np.float64)
+    zn = np.asarray(pool_predictions["zn"], dtype=np.float64)
+    if esp.shape != zn.shape:
+        raise ValueError(f"prediction shape mismatch: esp={esp.shape} zn={zn.shape}")
+    return np.column_stack([esp, zn])
+
+
+def _standardize_xy(xy: np.ndarray, reference: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ref = xy if reference is None else reference
+    finite_ref = ref[np.all(np.isfinite(ref), axis=1)]
+    if finite_ref.size == 0:
+        raise RuntimeError("cannot standardize property space with no finite reference points")
+    mean = finite_ref.mean(axis=0)
+    std = finite_ref.std(axis=0, ddof=0)
+    std[~np.isfinite(std) | (std <= 0)] = 1.0
+    return (xy - mean) / std, mean, std
+
+
+def _append_unselected(selected: list[int], n_pick: int, n_pool: int) -> list[int]:
+    if len(selected) >= n_pick:
+        return selected[:n_pick]
+    used = set(selected)
+    for idx in range(n_pool):
+        if idx not in used:
+            selected.append(int(idx))
+            used.add(idx)
+            if len(selected) == n_pick:
+                break
+    return selected
+
+
+def pick_by_uncertainty(
+    pool_records: list[dict[str, Any]],
+    seed_records: list[dict[str, Any]],
+    n_pick: int,
+    pool_predictions: dict[str, Any],
+) -> list[int]:
+    """Pick pool molecules farthest from the known seed set in property space.
+
+    Seed true ESP/Zn values are used because seed labels are already known.
+    Pool molecules are scored only by predicted ESP/Zn.
+    """
+    n_pick = min(n_pick, len(pool_records))
+    if n_pick <= 0:
+        return []
+    pool_xy = _prediction_matrix(pool_predictions)
+    seed_xy = np.column_stack(_true_property_arrays(seed_records))
+    reference = np.vstack([pool_xy[np.all(np.isfinite(pool_xy), axis=1)], seed_xy])
+    pool_z, mean, std = _standardize_xy(pool_xy, reference=reference)
+    seed_z = (seed_xy - mean) / std
+    finite = np.all(np.isfinite(pool_z), axis=1)
+    finite_idx = np.flatnonzero(finite)
+    if finite_idx.size == 0:
+        return _append_unselected([], n_pick, len(pool_records))
+
+    dists = np.full(len(pool_records), -np.inf, dtype=np.float64)
+    for start in range(0, finite_idx.size, 512):
+        idx = finite_idx[start : start + 512]
+        diff = pool_z[idx, None, :] - seed_z[None, :, :]
+        dists[idx] = np.sqrt(np.sum(diff * diff, axis=2)).min(axis=1)
+    selected = [int(i) for i in np.argsort(-dists)[: min(n_pick, finite_idx.size)]]
+    return _append_unselected(selected, n_pick, len(pool_records))
+
+
+def pick_by_property_maxmin(
+    pool_records: list[dict[str, Any]],
+    n_pick: int,
+    pool_predictions: dict[str, Any],
+) -> list[int]:
+    """Greedy farthest-point selection in standardized predicted ESP/Zn space."""
+    n_pick = min(n_pick, len(pool_records))
+    if n_pick <= 0:
+        return []
+    xy = _prediction_matrix(pool_predictions)
+    xy_z, _, _ = _standardize_xy(xy)
+    finite_idx = np.flatnonzero(np.all(np.isfinite(xy_z), axis=1))
+    if finite_idx.size == 0:
+        return _append_unselected([], n_pick, len(pool_records))
+
+    centroid = xy_z[finite_idx].mean(axis=0)
+    first = int(finite_idx[np.argmin(np.sum((xy_z[finite_idx] - centroid) ** 2, axis=1))])
+    selected = [first]
+    min_dists = np.full(len(pool_records), -np.inf, dtype=np.float64)
+    min_dists[finite_idx] = np.inf
+    min_dists[first] = -np.inf
+    while len(selected) < min(n_pick, finite_idx.size):
+        last = selected[-1]
+        dists = np.sqrt(np.sum((xy_z[finite_idx] - xy_z[last]) ** 2, axis=1))
+        min_dists[finite_idx] = np.minimum(min_dists[finite_idx], dists)
+        min_dists[selected] = -np.inf
+        selected.append(int(np.argmax(min_dists)))
+    return _append_unselected(selected, n_pick, len(pool_records))
+
+
+def pick_by_property_stratified(
+    pool_records: list[dict[str, Any]],
+    n_pick: int,
+    grid: dict[str, Any],
+    pool_predictions: dict[str, Any],
+    rng: np.random.Generator,
+) -> list[int]:
+    """Round-robin random draws from non-empty predicted property-grid cells."""
+    n_pick = min(n_pick, len(pool_records))
+    if n_pick <= 0:
+        return []
+    pred_xy = _prediction_matrix(pool_predictions)
+    finite = np.all(np.isfinite(pred_xy), axis=1)
+    x_edges = np.asarray(grid["bin_edges"][ESP_TARGET], dtype=np.float64)
+    y_edges = np.asarray(grid["bin_edges"][ZN_TARGET], dtype=np.float64)
+    cells = _cell_ids(pred_xy[:, 0], pred_xy[:, 1], x_edges, y_edges)
+
+    by_cell: dict[tuple[int, int], list[int]] = {}
+    for idx, ok in enumerate(finite):
+        if not ok:
+            continue
+        cell = (int(cells[idx, 0]), int(cells[idx, 1]))
+        by_cell.setdefault(cell, []).append(int(idx))
+    for indices in by_cell.values():
+        rng.shuffle(indices)
+
+    selected: list[int] = []
+    cell_order = sorted(by_cell)
+    while len(selected) < n_pick and cell_order:
+        next_order = []
+        for cell in cell_order:
+            if by_cell[cell]:
+                selected.append(by_cell[cell].pop())
+                if len(selected) == n_pick:
+                    break
+            if by_cell[cell]:
+                next_order.append(cell)
+        cell_order = next_order
+    return _append_unselected(selected, n_pick, len(pool_records))
+
+
 def _records_to_prediction_data(records: list[dict[str, Any]], torch, Data) -> list[Any]:
     dataset = []
     for record in records:
@@ -485,6 +629,50 @@ def evaluate(
     return metrics
 
 
+def run_all_pickers(
+    seed_records: list[dict[str, Any]],
+    pool_records: list[dict[str, Any]],
+    budget: int,
+    grid: dict[str, Any],
+    pool_predictions: dict[str, Any],
+    rng: np.random.Generator,
+    diversity_seed: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[int]]]:
+    """Run all sampling baselines without exposing pool ground-truth labels to pickers."""
+    picked_indices = {
+        "random": pick_by_random(pool_records, budget, rng),
+        "structural_diversity": pick_by_diversity(pool_records, budget, seed=diversity_seed),
+        "uncertainty_distance": pick_by_uncertainty(
+            pool_records, seed_records, budget, pool_predictions
+        ),
+        "property_maxmin": pick_by_property_maxmin(pool_records, budget, pool_predictions),
+        "property_stratified": pick_by_property_stratified(
+            pool_records, budget, grid, pool_predictions, rng
+        ),
+        "eyes_coverage": [],
+    }
+    coverage_idx, _ = pick_by_coverage(
+        pool_records,
+        eyes_esp={},
+        eyes_zn={},
+        n_pick=budget,
+        grid=grid,
+        args=None,
+        torch=None,
+        Data=None,
+        DataLoader=None,
+        device=None,
+        pool_predictions=pool_predictions,
+    )
+    picked_indices["eyes_coverage"] = coverage_idx
+
+    metrics = {
+        name: evaluate(indices, pool_records, grid)
+        for name, indices in picked_indices.items()
+    }
+    return metrics, picked_indices
+
+
 def plot_sampling(
     pool_records: list[dict[str, Any]],
     random_idx: list[int],
@@ -584,10 +772,19 @@ def plot_sweep(metrics: dict[str, Any]) -> Path:
     out_path = FIGURES_DIR / "coverage_sampling_sweep.png"
 
     fig, ax = plt.subplots(figsize=(7.5, 5))
+    new_picker_scores = {
+        picker: float(np.nanmean([
+            metrics["aggregate"][str(size)]["pickers"][picker]["normalized_entropy"]["mean"]
+            for size in seed_sizes
+        ]))
+        for picker in ["uncertainty_distance", "property_maxmin", "property_stratified"]
+    }
+    best_new_picker = max(new_picker_scores, key=new_picker_scores.get)
     for picker, label, color in [
         ("random", "random", "tab:gray"),
         ("structural_diversity", "structural diversity", "tab:orange"),
         ("eyes_coverage", "eyes coverage", "tab:blue"),
+        (best_new_picker, best_new_picker, "tab:green"),
     ]:
         means = [
             metrics["aggregate"][str(size)]["pickers"][picker]["normalized_entropy"]["mean"]
@@ -602,7 +799,10 @@ def plot_sweep(metrics: dict[str, Any]) -> Path:
     ax.invert_xaxis()
     ax.set_xlabel("seed size (DFT-labeled molecules)")
     ax.set_ylabel("picked-set normalized entropy")
-    ax.set_title(f"Coverage-sampling seed-size sweep, budget={metrics['budget']}")
+    ax.set_title(
+        f"Coverage-sampling seed-size sweep, budget={metrics['budget']} "
+        f"(best added baseline: {best_new_picker})"
+    )
     ax.legend(loc="best")
     ax.grid(True, which="both", color="0.9", linewidth=0.7)
     fig.tight_layout()
@@ -631,9 +831,8 @@ def _mean_std(values: list[float]) -> dict[str, float]:
 
 
 def _aggregate_seed_results(seed_results: list[dict[str, Any]]) -> dict[str, Any]:
-    pickers = ["random", "structural_diversity", "eyes_coverage"]
     aggregate: dict[str, Any] = {"pickers": {}, "eyes_pool_r2": {}}
-    for picker in pickers:
+    for picker in PICKER_ORDER:
         rows = [result["pickers"][picker] for result in seed_results]
         aggregate["pickers"][picker] = {
             "normalized_entropy": _mean_std([row["normalized_entropy"] for row in rows]),
@@ -663,7 +862,7 @@ def _aggregate_sweep_results(per_rep: list[dict[str, Any]]) -> dict[str, Any]:
             },
             "pickers": {},
         }
-        for picker in ["random", "structural_diversity", "eyes_coverage"]:
+        for picker in PICKER_ORDER:
             picker_rows = [row["pickers"][picker] for row in rows]
             aggregate[str(seed_size)]["pickers"][picker] = {
                 "normalized_entropy": _mean_std(
@@ -696,7 +895,7 @@ def _print_single_summary(metrics: dict[str, Any]) -> None:
     print()
     print(f"{'picker':22s} {'occupied':>10s} {'H_norm':>10s} {'ESP_range':>11s} {'Zn_range':>11s}")
     print("-" * 70)
-    for name in ["random", "structural_diversity", "eyes_coverage"]:
+    for name in PICKER_ORDER:
         row = metrics["pickers"][name]
         spread = row["property_range_spread"]
         print(
@@ -722,7 +921,7 @@ def _print_aggregate_summary(metrics: dict[str, Any]) -> None:
     print()
     print(f"{'picker':22s} {'H_norm(mean+/-std)':>22s} {'occupied(mean+/-std)':>24s}")
     print("-" * 72)
-    for name in ["random", "structural_diversity", "eyes_coverage"]:
+    for name in PICKER_ORDER:
         row = aggregate["pickers"][name]
         print(
             f"{name:22s} {_fmt_mean_std(row['normalized_entropy']):>22s} "
@@ -775,9 +974,10 @@ def _print_sweep_summary(metrics: dict[str, Any]) -> None:
     print()
     print(
         f"{'seed_size':>9s} {'eyesESP_R2':>17s} {'random_H':>17s} "
-        f"{'diversity_H':>17s} {'coverage_H':>17s} {'coverage-random':>17s}"
+        f"{'diversity_H':>17s} {'uncert_H':>17s} {'prop_maxmin_H':>17s} "
+        f"{'stratified_H':>17s} {'coverage_H':>17s} {'coverage-random':>17s}"
     )
-    print("-" * 98)
+    print("-" * 170)
     for seed_size in metrics["seed_sizes"]:
         row = metrics["aggregate"][str(seed_size)]
         print(
@@ -785,6 +985,9 @@ def _print_sweep_summary(metrics: dict[str, Any]) -> None:
             f"{_fmt_mean_std(row['eyes_pool_r2']['esp']):>17s} "
             f"{_fmt_mean_std(row['pickers']['random']['normalized_entropy']):>17s} "
             f"{_fmt_mean_std(row['pickers']['structural_diversity']['normalized_entropy']):>17s} "
+            f"{_fmt_mean_std(row['pickers']['uncertainty_distance']['normalized_entropy']):>17s} "
+            f"{_fmt_mean_std(row['pickers']['property_maxmin']['normalized_entropy']):>17s} "
+            f"{_fmt_mean_std(row['pickers']['property_stratified']['normalized_entropy']):>17s} "
             f"{_fmt_mean_std(row['pickers']['eyes_coverage']['normalized_entropy']):>17s} "
             f"{_fmt_mean_std(row['coverage_minus_random_entropy']):>17s}"
         )
@@ -865,18 +1068,22 @@ def run_one_seed(
     eyes_zn = train_eyes_on_seed(seed_records, "zn", run_args, torch, Data, DataLoader, device)
 
     budget = min(run_args.budget, len(pool_records))
-    random_idx = pick_by_random(pool_records, budget, rng)
-    diversity_idx = pick_by_diversity(pool_records, budget, seed=run_args.seed)
-    coverage_idx, pool_predictions = pick_by_coverage(
-        pool_records, eyes_esp, eyes_zn, budget, grid, run_args, torch, Data, DataLoader, device
+    pool_predictions = predict_pool_with_eyes(
+        pool_records, eyes_esp, eyes_zn, run_args, torch, Data, DataLoader, device
     )
-
-    random_metrics = evaluate(random_idx, pool_records, grid)
-    diversity_metrics = evaluate(diversity_idx, pool_records, grid)
-    coverage_metrics = evaluate(coverage_idx, pool_records, grid, pool_predictions)
-    eyes_pool_metrics = coverage_metrics.pop("eyes_pool_metrics")
+    eyes_pool_metrics = _eyes_pool_metrics(pool_records, pool_predictions)
+    picker_metrics, picked_indices = run_all_pickers(
+        seed_records, pool_records, budget, grid, pool_predictions, rng, run_args.seed
+    )
     fig_path = (
-        plot_sampling(pool_records, random_idx, diversity_idx, coverage_idx, grid, run_args)
+        plot_sampling(
+            pool_records,
+            picked_indices["random"],
+            picked_indices["structural_diversity"],
+            picked_indices["eyes_coverage"],
+            grid,
+            run_args,
+        )
         if make_figure
         else None
     )
@@ -900,11 +1107,15 @@ def run_one_seed(
             "zn": {k: v for k, v in eyes_zn.items() if k != "model"},
         },
         "eyes_pool_metrics": eyes_pool_metrics,
-        "pickers": {
-            "random": random_metrics,
-            "structural_diversity": diversity_metrics,
-            "eyes_coverage": coverage_metrics,
+        "picker_notes": {
+            "uncertainty_distance": (
+                "distance-to-seed proxy in standardized ESP/Zn space; seed true labels are used "
+                "because seed labels are already known, pool values are eyes predictions"
+            ),
+            "property_maxmin": "greedy farthest-point selection in standardized predicted ESP/Zn space",
+            "property_stratified": "round-robin random draws from predicted 7x7 ESP/Zn grid cells",
         },
+        "pickers": picker_metrics,
         "figure": str(fig_path) if fig_path is not None else None,
     }
     _print_single_summary(metrics)
@@ -1119,25 +1330,9 @@ def run_sweep(args, grid: dict[str, Any], torch, Data, DataLoader, device) -> di
             eyes_pool = _eyes_pool_metrics(pool_records, pool_predictions)
 
             budget = min(run_args.budget, len(pool_records))
-            random_idx = pick_by_random(pool_records, budget, rng)
-            diversity_idx = pick_by_diversity(pool_records, budget, seed=run_seed)
-            coverage_idx, _ = pick_by_coverage(
-                pool_records,
-                eyes_esp,
-                eyes_zn,
-                budget,
-                grid,
-                run_args,
-                torch,
-                Data,
-                DataLoader,
-                device,
-                pool_predictions=pool_predictions,
+            picker_metrics, _ = run_all_pickers(
+                seed_records, pool_records, budget, grid, pool_predictions, rng, run_seed
             )
-
-            random_metrics = evaluate(random_idx, pool_records, grid)
-            diversity_metrics = evaluate(diversity_idx, pool_records, grid)
-            coverage_metrics = evaluate(coverage_idx, pool_records, grid)
             per_rep.append(
                 {
                     "seed_size": int(seed_size),
@@ -1147,11 +1342,7 @@ def run_sweep(args, grid: dict[str, Any], torch, Data, DataLoader, device) -> di
                     "n_seed": int(len(seed_records)),
                     "n_pool": int(len(pool_records)),
                     "eyes_pool_metrics": eyes_pool,
-                    "pickers": {
-                        "random": random_metrics,
-                        "structural_diversity": diversity_metrics,
-                        "eyes_coverage": coverage_metrics,
-                    },
+                    "pickers": picker_metrics,
                 }
             )
 
@@ -1169,6 +1360,14 @@ def run_sweep(args, grid: dict[str, Any], torch, Data, DataLoader, device) -> di
             "pickers_use_ground_truth": False,
             "ground_truth_revealed_only_in_evaluate": True,
             "eyes_trained_only_on_seed": True,
+        },
+        "picker_notes": {
+            "uncertainty_distance": (
+                "distance-to-seed proxy in standardized ESP/Zn space; seed true labels are used "
+                "because seed labels are already known, pool values are eyes predictions"
+            ),
+            "property_maxmin": "greedy farthest-point selection in standardized predicted ESP/Zn space",
+            "property_stratified": "round-robin random draws from predicted 7x7 ESP/Zn grid cells",
         },
         "per_rep_results": per_rep,
         "aggregate": aggregate,
@@ -1260,6 +1459,14 @@ def main() -> None:
                 "pickers_use_ground_truth": False,
                 "ground_truth_revealed_only_in_evaluate": True,
                 "eyes_trained_only_on_seed": True,
+            },
+            "picker_notes": {
+                "uncertainty_distance": (
+                    "distance-to-seed proxy in standardized ESP/Zn space; seed true labels are used "
+                    "because seed labels are already known, pool values are eyes predictions"
+                ),
+                "property_maxmin": "greedy farthest-point selection in standardized predicted ESP/Zn space",
+                "property_stratified": "round-robin random draws from predicted 7x7 ESP/Zn grid cells",
             },
             "per_seed_results": seed_results,
             "aggregate": aggregate,
