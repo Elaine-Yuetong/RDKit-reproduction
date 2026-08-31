@@ -338,13 +338,11 @@ Additional:
 
   So read the chart like this:
 
-   Chart position                    Meaning
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   Random 场景 group                 easy/random split experiment
-  ────────────────────────────────  ──────────────────────────────────────────────────────────
-   Source 场景 group                 hard baseline-to-agent experiment
-  ────────────────────────────────  ──────────────────────────────────────────────────────────
-   random bar inside either group    the dumb baseline sampling method inside that experiment
+| Chart position | Meaning |
+|---|---|
+| **Random 场景 group** | easy/random split experiment |
+| **Source 场景 group** | hard baseline-to-agent experiment |
+| **random bar inside either group** | the dumb baseline sampling method inside that experiment |
 
   The code confirms this split:
 
