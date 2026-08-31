@@ -322,3 +322,32 @@ To add a new picker, implement it in
 - `benchmark_system_guide.html`: Phase 4 system/usage guide for the standardized benchmark.
 - `phase4_generation/benchmark/README.md`: narrower benchmark package README.
 
+
+
+Additional:
+• There are two different meanings of random in the bar plot.
+
+  In benchmark_report_full.html:248, the x-axis has two scenarios:
+
+  - Random 场景: the benchmark creates a random seed/pool split from the whole DFT dataset. The eyes are trained on the random seed set, then pick from the remaining pool.
+  - Source 场景: the deployment-style split. The seed/training set is baseline molecules; the pool/test side is agent-discovered molecules. This is harder and closer to the real mentor use case.
+
+  Then inside each scenario, one of the bars is also called random. That is not a scenario. It is a picker/method:
+
+  - random picker: blindly selects molecules uniformly at random from that scenario’s pool. It does not use structure, eyes predictions, or coverage logic.
+
+  So read the chart like this:
+
+   Chart position                    Meaning
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Random 场景 group                 easy/random split experiment
+  ────────────────────────────────  ──────────────────────────────────────────────────────────
+   Source 场景 group                 hard baseline-to-agent experiment
+  ────────────────────────────────  ──────────────────────────────────────────────────────────
+   random bar inside either group    the dumb baseline sampling method inside that experiment
+
+  The code confirms this split:
+
+  - Scenarios are defined in phase4_generation/coverage_sampling_eval.py:86: scenario == "random" and scenario == "source".
+  - Picker names include a separate random method in phase4_generation/coverage_sampling_eval.py:52.
+  - The report’s x-axis labels are at benchmark_report_full.html:248, and the random bar is at benchmark_report_full.html:269.
